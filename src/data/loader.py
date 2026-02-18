@@ -1,3 +1,11 @@
+"""
+loader.py
+
+Purpose:
+- Download a raw tar from Hugging Face.
+- Extract tar safely and cache extraction by a marker file.
+"""
+
 import os
 import tarfile
 from pathlib import Path
@@ -26,14 +34,13 @@ def download_raw_tar(
     revision: Optional[str] = None,
     token: Optional[str] = None,
 ) -> Path:
-    tok = token or os.getenv("HF_TOKEN")
     return Path(
         hf_hub_download(
             repo_id=repo_id,
             filename=path_in_repo,
             repo_type=repo_type,
             revision=revision,
-            token=tok,
+            token=token,
         )
     )
 
