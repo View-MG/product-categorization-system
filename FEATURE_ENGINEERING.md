@@ -280,4 +280,4 @@ No background removal or segmentation is applied. Raw images are processed whole
 
 ---
 
-_This document reflects the `main` branch at the time of writing. Update accordingly if the pipeline or architecture changes._
+_This document reflects the `feat/feature-engineering` branch at the time of writing. Update accordingly if the pipeline or architecture changes._
