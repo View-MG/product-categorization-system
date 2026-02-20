@@ -170,16 +170,22 @@ def main() -> None:
     print(f"  train : {train_ds}")
     print(f"  val   : {val_ds}")
 
-    class_names = train_ds.classes   # e.g. ["beverages", "dry_food", "other", "snacks"]
+    class_names = train_ds.classes   # e.g. ["beverages", "dry_food", "non_food", "snacks"]
     num_classes = train_ds.num_classes
 
     # ── DataLoaders ───────────────────────────────────────────────────────
+    use_pin_memory = True
+    if cfg.device == "cpu":
+        use_pin_memory = False
+    elif cfg.device is None and not (torch.cuda.is_available() or torch.backends.mps.is_available()):
+        use_pin_memory = False
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -187,7 +193,7 @@ def main() -> None:
         batch_size=cfg.batch_size,
         shuffle=False,
         num_workers=cfg.num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
     )
 
     # ── Model ─────────────────────────────────────────────────────────────

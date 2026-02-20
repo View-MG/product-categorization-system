@@ -10,7 +10,7 @@ Expected CSV columns (from prepare.py / validate.py pipeline):
     abs_path, label_coarse, split, barcode, img_ok, w, h, file_size
 
 Expected label_map.json format  (from prepare.py::attach_label_map):
-    {"beverages": 0, "snacks": 1, "dry_food": 2, "other": 3}
+    {"beverages": 0, "snacks": 1, "dry_food": 2, "non_food": 3}
 """
 
 import json
@@ -63,6 +63,12 @@ class ProductDataset(Dataset):
             raise ValueError("manifest must contain column 'abs_path'")
         if "label_coarse" not in manifest.columns:
             raise ValueError("manifest must contain column 'label_coarse'")
+
+        # ── 1b. Filter out corrupted images ───────────────────────────────
+        if "img_ok" in manifest.columns:
+            manifest = manifest[manifest["img_ok"] == True].copy()
+        elif "file_size" in manifest.columns:
+            manifest = manifest[manifest["file_size"] > 0].copy()
 
         # ── 2. Filter by split ────────────────────────────────────────────
         if split is not None:

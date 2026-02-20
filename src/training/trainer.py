@@ -204,8 +204,8 @@ class Trainer:
         print(f"  Run dir  : {self.cfg.run_dir()}")
         print(f"{'='*60}\n")
 
-        last_val_labels: List[int] = []
-        last_val_preds: List[int] = []
+        best_val_labels: List[int] = []
+        best_val_preds: List[int] = []
 
         for epoch in range(1, self.cfg.epochs + 1):
             print(f"── Epoch {epoch}/{self.cfg.epochs} ──")
@@ -215,7 +215,6 @@ class Trainer:
 
             # Validation
             val_loss, val_metrics, val_labels, val_preds = self._val_epoch()
-            last_val_labels, last_val_preds = val_labels, val_preds
 
             # LR step
             if self.scheduler is not None:
@@ -245,7 +244,8 @@ class Trainer:
             )
 
             # Checkpoint
-            self._save_best_checkpoint(val_metrics["f1_macro"], epoch)
+            if self._save_best_checkpoint(val_metrics["f1_macro"], epoch):
+                best_val_labels, best_val_preds = val_labels, val_preds
 
         # ── Post-training outputs ─────────────────────────────────────────
         run_dir = self.cfg.run_dir()
@@ -255,8 +255,8 @@ class Trainer:
         plot_loss_curves(csv_path, run_dir / "loss_curve.png")
         plot_accuracy_curve(csv_path, run_dir / "accuracy_curve.png")
 
-        # Confusion matrix on final val epoch
-        cm = get_confusion_matrix(last_val_labels, last_val_preds)
+        # Confusion matrix on best val epoch
+        cm = get_confusion_matrix(best_val_labels, best_val_preds, self.class_names)
         plot_confusion_matrix(
             cm,
             self.class_names,
@@ -266,7 +266,7 @@ class Trainer:
 
         print(f"\n── Final Classification Report (val) ──")
         report = get_classification_report(
-            last_val_labels, last_val_preds, self.class_names
+            best_val_labels, best_val_preds, self.class_names
         )
         print(report)
 

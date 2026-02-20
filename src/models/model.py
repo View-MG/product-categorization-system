@@ -55,7 +55,7 @@ class ProductClassifier(nn.Module):
     ----------
     num_classes : int
         Number of output classes. Must match ``len(label_map)``.
-        Default = 4  (beverages, snacks, dry_food, other) — matches label_map.json.
+        Default = 4  (beverages, snacks, dry_food, non_food) — matches label_map.json.
     freeze_backbone : bool
         If True, all backbone parameters are frozen so only the new
         classification head is updated during Stage 1 training.

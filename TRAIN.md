@@ -5,7 +5,7 @@ A prototype ML system that classifies **product package images** into coarse cat
 - `beverages`
 - `snacks`
 - `dry_food`
-- `other`
+- `non_food`
 
 ---
 
@@ -67,20 +67,20 @@ images/
   beverages/0000000000123.jpg
   snacks/0000000000456.jpg
   dry_food/0000000000789.jpg
-  other/0000000000999.jpg
+  non_food/0000000000999.jpg
 ```
 
 ### 2.2 Metadata (`metadata.csv`)
 
-| Column               | Description                                         |
-| :------------------- | :-------------------------------------------------- |
-| `barcode`            | 13-digit normalized EAN barcode                     |
-| `product_name`       | Product name (user-generated, may be multilingual)  |
-| `categories_tags_en` | English category tags from OFF                      |
-| `label_coarse`       | Our coarse label: `beverages/snacks/dry_food/other` |
-| `image_id`           | Relative path to image file                         |
-| `image_url`          | Original URL (for attribution)                      |
-| `source`             | Data source identifier (`off`)                      |
+| Column               | Description                                            |
+| :------------------- | :----------------------------------------------------- |
+| `barcode`            | 13-digit normalized EAN barcode                        |
+| `product_name`       | Product name (user-generated, may be multilingual)     |
+| `categories_tags_en` | English category tags from OFF                         |
+| `label_coarse`       | Our coarse label: `beverages/snacks/dry_food/non_food` |
+| `image_id`           | Relative path to image file                            |
+| `image_url`          | Original URL (for attribution)                         |
+| `source`             | Data source identifier (`off`)                         |
 
 ---
 

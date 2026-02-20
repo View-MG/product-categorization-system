@@ -51,7 +51,9 @@ def compute_metrics(
     y_pred = np.array(all_preds)
 
     acc = float(accuracy_score(y_true, y_pred))
-    f1_macro = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    
+    labels_arg = list(range(len(class_names))) if class_names is not None else None
+    f1_macro = float(f1_score(y_true, y_pred, labels=labels_arg, average="macro", zero_division=0))
 
     result: Dict[str, float] = {
         "accuracy": acc,
@@ -59,7 +61,7 @@ def compute_metrics(
     }
 
     if class_names:
-        per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+        per_class = f1_score(y_true, y_pred, labels=labels_arg, average=None, zero_division=0)
         for name, score in zip(class_names, per_class):
             result[f"f1_{name}"] = float(score)
 
@@ -72,9 +74,11 @@ def get_classification_report(
     class_names: Optional[List[str]] = None,
 ) -> str:
     """Return a formatted sklearn classification report string."""
+    labels_arg = list(range(len(class_names))) if class_names is not None else None
     return classification_report(
         all_labels,
         all_preds,
+        labels=labels_arg,
         target_names=class_names,
         zero_division=0,
     )
@@ -83,6 +87,8 @@ def get_classification_report(
 def get_confusion_matrix(
     all_labels: List[int],
     all_preds: List[int],
+    class_names: Optional[List[str]] = None,
 ) -> np.ndarray:
     """Return the confusion matrix as a 2-D numpy array."""
-    return confusion_matrix(all_labels, all_preds)
+    labels_arg = list(range(len(class_names))) if class_names is not None else None
+    return confusion_matrix(all_labels, all_preds, labels=labels_arg)

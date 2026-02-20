@@ -148,6 +148,15 @@ class _TransferModel(nn.Module):
         if freeze_backbone:
             self.freeze_backbone()
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self._backbone_frozen and mode:
+            # Force backbone BN layers back to eval mode to preserve running stats
+            for m in self._backbone.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eval()
+        return self
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._backbone(x)
 

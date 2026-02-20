@@ -144,7 +144,7 @@ Input: torch.FloatTensor (B, 3, 224, 224)
 └──────────────────────────────────────────────────┘
     │
     ▼
-Output Logits: (B, 4)   — [beverages, snacks, dry_food, other]
+Output Logits: (B, 4)   — [beverages, snacks, dry_food, non_food]
 ```
 
 **Feature hierarchy:**
@@ -176,7 +176,7 @@ Managed by `ProductDataset` in `src/data/dataset.py`. The label mapping is loade
   "beverages": 0,
   "snacks": 1,
   "dry_food": 2,
-  "other": 3
+  "non_food": 3
 }
 ```
 
