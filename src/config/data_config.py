@@ -16,7 +16,7 @@ class DataConfig:
     # --- Hugging Face settings ---
     repo_id: str = "Phathanan/product-categorization-system"
     repo_type: str = "dataset"
-    raw_tar_in_repo: str = "data/raw/data_v1.tar"
+    raw_tar_in_repo: str = "data/raw/data_v2.tar"
     token: Optional[str] = None
     revision: Optional[str] = None
 
@@ -27,7 +27,7 @@ class DataConfig:
     raw_metadata_name: str = "metadata.csv"
 
     # --- Labels ---
-    labels: List[str] = field(default_factory=lambda: ["beverages", "snacks", "dry_food", "personal_item", "other"])
+    labels: List[str] = field(default_factory=lambda: ["beverages", "snacks", "dry_food", "non_food"])
     dedup_by_barcode: bool = False
     cap_per_label: Optional[int] = None
     

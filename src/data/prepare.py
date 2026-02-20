@@ -19,7 +19,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-MANIFEST_DROP_COLS = ["image_id","split", "img_ok", "w", "h", "file_size"]
+MANIFEST_DROP_COLS = ["image_id","split", "img_ok", "w", "h", "file_size", "image_url", "source", "license_db", "license_images", "image_path"]
 
 
 def norm_barcode(x: object) -> str:
