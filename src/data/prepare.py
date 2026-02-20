@@ -19,7 +19,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-MANIFEST_DROP_COLS = ["image_id","split", "img_ok", "w", "h", "file_size", "image_url", "source", "license_db", "license_images", "image_path"]
+MANIFEST_DROP_COLS = ["image_id","split", "img_ok", "w", "h", "file_size", "image_url", "source", "license_db", "license_images"]
 
 
 def norm_barcode(x: object) -> str:
@@ -98,8 +98,8 @@ def basic_clean(
     - Remove empty required fields
     - Optional label filtering
     - Drop duplicates by abs_path
-    - Optional: dedup by barcode (keep 1 image per product)
-    - Optional: cap per label
+    - dedup by barcode (keep 1 image per product)
+    - cap per label
     """
     out = df.copy()
 
@@ -147,8 +147,6 @@ def build_manifest(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build the final train-ready manifest:
     - drop all columns except MANIFEST_CLEAN_COLS (drop-columns approach)
-    - trim strings + remove rows with "" in required fields
-    - DO NOT include split column (method B: split stored in splits.json only)
     """
     out = df.copy()
 
@@ -156,10 +154,5 @@ def build_manifest(df: pd.DataFrame) -> pd.DataFrame:
     drop_cols = [c for c in MANIFEST_DROP_COLS if c in out.columns]
     if drop_cols:
         out = out.drop(columns=drop_cols)
-
-    out["barcode"] = out["barcode"].astype("string").fillna("").str.strip()
-    out["image_path"] = out["image_path"].astype("string").fillna("").str.strip()
-    out["label_coarse"] = out["label_coarse"].astype("string").fillna("").str.strip()
-
-    out = out[(out["barcode"] != "") & (out["image_path"] != "") & (out["label_coarse"] != "")]
+        
     return out.reset_index(drop=True)
