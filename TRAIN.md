@@ -2,10 +2,8 @@
 
 A prototype ML system that classifies **product package images** into coarse categories:
 
-- `beverages`
-- `snacks`
-- `dry_food`
-- `non_food`
+- `beverage`
+- `snack`
 
 ---
 
@@ -64,10 +62,8 @@ Example layout:
 
 ```text
 images/
-  beverages/0000000000123.jpg
-  snacks/0000000000456.jpg
-  dry_food/0000000000789.jpg
-  non_food/0000000000999.jpg
+  beverage/0000000000123.jpg
+  snack/0000000000456.jpg
 ```
 
 ### 2.2 Metadata (`metadata.csv`)
@@ -77,7 +73,7 @@ images/
 | `barcode`            | 13-digit normalized EAN barcode                        |
 | `product_name`       | Product name (user-generated, may be multilingual)     |
 | `categories_tags_en` | English category tags from OFF                         |
-| `label_coarse`       | Our coarse label: `beverages/snacks/dry_food/non_food` |
+| `label_coarse`       | Our coarse label: `beverage/snack` |
 | `image_id`           | Relative path to image file                            |
 | `image_url`          | Original URL (for attribution)                         |
 | `source`             | Data source identifier (`off`)                         |
@@ -131,7 +127,7 @@ See [FEATURE_ENGINEERING.md](FEATURE_ENGINEERING.md) for full details. Summary:
 | Val/Test transform | Resize(256) → CenterCrop(224) → Normalize                                  |
 | Backbone           | EfficientNet-B0 (ImageNet pre-trained)                                     |
 | Feature dimension  | 1,280                                                                      |
-| Number of classes  | 4                                                                          |
+| Number of classes  | 2                                                                          |
 | Label encoding     | Integer index via `label_map.json`                                         |
 
 ---
@@ -222,7 +218,7 @@ Tests cover:
 - Transform output shapes and dtypes
 - ImageNet normalization applied correctly
 - Train transform stochasticity / val transform determinism
-- Label map correctness (4 classes, values 0–3)
+- Label map correctness (2 classes, values 0–1)
 - `ProductDataset` `__getitem__` output shapes
 - Model forward pass output shape and dtype
 
@@ -245,9 +241,9 @@ Flatten                 → (B, 1280)
     │
 Dropout(p=0.3)
     │
-Linear(1280 → 4)
+Linear(1280 → 2)
     │
-Output Logits: (B, 4)   ← pair with nn.CrossEntropyLoss
+Output Logits: (B, 2)   ← pair with nn.CrossEntropyLoss
 ```
 
 ---

@@ -106,6 +106,16 @@ def basic_clean(
             raise ValueError(f"metadata must contain {col}")
 
     out["label_coarse"] = out["label_coarse"].astype("string").fillna("").str.strip()
+    
+    # Remap labels to handle plural forms from raw data before filtering
+    def remap_label(lbl: str) -> str:
+        lbl = lbl.lower()
+        if lbl in ["snacks", "snack"]: return "snack"
+        if lbl in ["beverages", "beverage"]: return "beverage"
+        return lbl
+        
+    out["label_coarse"] = out["label_coarse"].apply(remap_label)
+
     out["barcode"] = out["barcode"].astype("string").fillna("").str.strip()
     out["abs_path"] = out["abs_path"].astype("string").fillna("").str.strip()
 

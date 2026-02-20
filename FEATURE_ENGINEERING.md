@@ -140,11 +140,11 @@ Input: torch.FloatTensor (B, 3, 224, 224)
 ┌──────────────────────────────────────────────────┐
 │  Classification Head                             │
 │  Dropout(p=0.3)                                  │
-│  Linear(1280 → 4)                                │
+│  Linear(1280 → 2)                                │
 └──────────────────────────────────────────────────┘
     │
     ▼
-Output Logits: (B, 4)   — [beverages, snacks, dry_food, non_food]
+Output Logits: (B, 4)   — [beverage, snack]
 ```
 
 **Transfer Learning Strategy:**
@@ -165,10 +165,8 @@ Managed by `ProductDataset` in `src/data/dataset.py`. The label mapping is loade
 
 ```json
 {
-  "beverages": 0,
-  "snacks": 1,
-  "dry_food": 2,
-  "non_food": 3
+  "beverage": 0,
+  "snack": 1
 }
 ```
 
@@ -178,7 +176,7 @@ Managed by `ProductDataset` in `src/data/dataset.py`. The label mapping is loade
 
 ```python
 image : torch.FloatTensor  # shape (3, 224, 224)
-label : torch.LongTensor   # scalar class index (0–3)
+label : torch.LongTensor   # scalar class index (0–1)
 ```
 
 ---

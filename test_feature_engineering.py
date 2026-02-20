@@ -86,19 +86,19 @@ check("val transform produces identical outputs (deterministic)",
 
 # ── 4. Label map ──────────────────────────────────────────────────────────────
 print("\n── 4. Label map ──────────────────────────────────────────────────────")
-label_map: dict = json.loads(LABEL_MAP.read_text())
-expected_classes = {"beverages", "snacks", "dry_food", "non_food"}
-check("label_map has exactly 4 classes",        len(label_map) == 4, str(set(label_map)))
-check("label_map keys match expected classes",  set(label_map) == expected_classes,
-      str(set(label_map)))
-check("label_map values are 0–3",
-      set(label_map.values()) == {0, 1, 2, 3}, str(set(label_map.values())))
-
-# ── 5. ProductDataset ──────────────────────────────────────────────────────────
-print("\n── 5. ProductDataset ─────────────────────────────────────────────────")
 from src.data.dataset import ProductDataset
 
 ds_train = ProductDataset(MANIFEST, LABEL_MAP, split="train", transform=get_train_transforms())
+label_map = ds_train.label_map
+expected_classes = {"beverage", "snack"}
+check("label_map has exactly 2 classes",        len(label_map) == 2, str(set(label_map)))
+check("label_map keys match expected classes",  set(label_map) == expected_classes,
+      str(set(label_map)))
+check("label_map values are 0–1",
+      set(label_map.values()) == {0, 1}, str(set(label_map.values())))
+
+# ── 5. ProductDataset ──────────────────────────────────────────────────────────
+print("\n── 5. ProductDataset ─────────────────────────────────────────────────")
 ds_val   = ProductDataset(MANIFEST, LABEL_MAP, split="val",   transform=get_val_transforms())
 ds_test  = ProductDataset(MANIFEST, LABEL_MAP, split="test",  transform=get_val_transforms())
 
@@ -107,31 +107,33 @@ check("val   split non-empty",  len(ds_val)   > 0, f"n={len(ds_val)}")
 check("test  split non-empty",  len(ds_test)  > 0, f"n={len(ds_test)}")
 
 # __getitem__
-img, lbl = ds_train[0]
-check("__getitem__ returns image tensor (3,224,224)", tuple(img.shape) == (3, 224, 224),
+item = ds_train[0]
+img = item["pixel_values"]
+lbl = item["labels"]
+check("__getitem__ returns pixel_values tensor (3,224,224)", tuple(img.shape) == (3, 224, 224),
       str(tuple(img.shape)))
 check("__getitem__ returns scalar LongTensor label",
       lbl.shape == torch.Size([]) and lbl.dtype == torch.long,
       f"shape={lbl.shape} dtype={lbl.dtype}")
-check("label value is in valid range (0–3)", 0 <= lbl.item() <= 3, str(lbl.item()))
+check("label value is in valid range (0–1)", 0 <= lbl.item() <= 1, str(lbl.item()))
 
 # Val determinism end-to-end
-img2, lbl2 = ds_val[0]
-img3, lbl3 = ds_val[0]
+img2 = ds_val[0]["pixel_values"]
+img3 = ds_val[0]["pixel_values"]
 check("val dataset is deterministic (same item twice)", torch.allclose(img2, img3))
 
 # ── 6. Model forward pass ─────────────────────────────────────────────────────
 print("\n── 6. Model forward pass ─────────────────────────────────────────────")
-from src.models.model import ProductClassifier
+from src.models.factory import build_model
 
-model = ProductClassifier(num_classes=4, freeze_backbone=True, pretrained=False)
+model = build_model("resnet50", num_classes=2, freeze_backbone=True)
 model.eval()
 
 batch = torch.stack([img, img], dim=0)  # (2, 3, 224, 224)
 with torch.no_grad():
-    logits = model(batch)
+    logits = model(pixel_values=batch)
 
-check("model output shape == (2, 4)",    tuple(logits.shape) == (2, 4), str(tuple(logits.shape)))
+check("model output shape == (2, 2)",    tuple(logits.shape) == (2, 2), str(tuple(logits.shape)))
 check("model output dtype == float32",   logits.dtype == torch.float32, str(logits.dtype))
 check("model output finite (no NaN/Inf)", torch.isfinite(logits).all().item())
 
@@ -143,6 +145,5 @@ if errors:
         print(f"  • {e}")
     sys.exit(1)
 else:
-    total = 20  # update if you add checks
     print(f"\033[92mAll checks passed.\033[0m")
     sys.exit(0)

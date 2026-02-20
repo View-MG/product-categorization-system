@@ -21,8 +21,8 @@ from typing import Optional
 class TrainConfig:
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model_name: str = "resnet18"
-    """One of: simple_cnn | resnet18 | mobilenetv2"""
+    model_name: str = "resnet50"
+    """One of: resnet50 | mobilenetv3_large"""
 
     freeze_backbone: bool = True
     """Stage 1: freeze backbone, train head only.  Use --no-freeze to disable."""
@@ -55,8 +55,8 @@ class TrainConfig:
     image_size: int = 224
 
     # ── Output directories ────────────────────────────────────────────────
-    output_dir: Path = Path("outputs")
-    """Root directory; run-specific sub-folder is created automatically."""
+    output_dir: Path = Path("runs")
+    """Root directory; HF Trainer and custom logic will put outputs here."""
 
     # ── Reproducibility ──────────────────────────────────────────────────
     seed: int = 42

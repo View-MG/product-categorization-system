@@ -23,7 +23,7 @@ from typing import Literal, Optional
 import torch
 import torch.nn as nn
 from torchvision import models
-from torchvision.models import ResNet18_Weights, MobileNet_V2_Weights
+from torchvision.models import ResNet50_Weights, MobileNet_V3_Large_Weights
 
 # ── SimpleCNN ─────────────────────────────────────────────────────────────────
 
@@ -157,8 +157,14 @@ class _TransferModel(nn.Module):
                     m.eval()
         return self
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._backbone(x)
+    def forward(self, pixel_values: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None, x: Optional[torch.Tensor] = None):
+        inputs = pixel_values if pixel_values is not None else x
+        logits = self._backbone(inputs)
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits, labels)
+            return (loss, logits)
+        return logits
 
     def freeze_backbone(self) -> None:
         for name, param in self._backbone.named_parameters():
@@ -199,13 +205,9 @@ class _TransferModel(nn.Module):
         )
 
 
-def _build_resnet18(num_classes: int, freeze_backbone: bool, dropout: float) -> _TransferModel:
-    """
-    ResNet-18 with ImageNet-1K pre-trained weights.
-    Final FC replaced with Dropout → Linear(num_classes).
-    """
-    backbone = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-    in_features = backbone.fc.in_features          # 512 for ResNet-18
+def _build_resnet50(num_classes: int, freeze_backbone: bool, dropout: float) -> _TransferModel:
+    backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+    in_features = backbone.fc.in_features
     backbone.fc = nn.Sequential(
         nn.Dropout(p=dropout),
         nn.Linear(in_features, num_classes),
@@ -215,19 +217,15 @@ def _build_resnet18(num_classes: int, freeze_backbone: bool, dropout: float) -> 
     return _TransferModel(backbone, num_classes, freeze_backbone)
 
 
-def _build_mobilenetv2(num_classes: int, freeze_backbone: bool, dropout: float) -> _TransferModel:
-    """
-    MobileNet-V2 with ImageNet-1K pre-trained weights.
-    Final classifier replaced with Dropout → Linear(num_classes).
-    """
-    backbone = models.mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1)
-    in_features = backbone.classifier[1].in_features   # 1280 for MobileNet-V2
-    backbone.classifier = nn.Sequential(
+def _build_mobilenetv3_large(num_classes: int, freeze_backbone: bool, dropout: float) -> _TransferModel:
+    backbone = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2)
+    in_features = backbone.classifier[-1].in_features
+    backbone.classifier[-1] = nn.Sequential(
         nn.Dropout(p=dropout),
         nn.Linear(in_features, num_classes),
     )
-    nn.init.xavier_uniform_(backbone.classifier[1].weight)
-    nn.init.zeros_(backbone.classifier[1].bias)
+    nn.init.xavier_uniform_(backbone.classifier[-1][1].weight)
+    nn.init.zeros_(backbone.classifier[-1][1].bias)
     return _TransferModel(backbone, num_classes, freeze_backbone)
 
 
@@ -235,11 +233,11 @@ def _build_mobilenetv2(num_classes: int, freeze_backbone: bool, dropout: float) 
 
 _REGISTRY = {
     "simple_cnn":  lambda nc, fb, do: SimpleCNN(num_classes=nc, dropout=do),
-    "resnet18":    _build_resnet18,
-    "mobilenetv2": _build_mobilenetv2,
+    "resnet50":    _build_resnet50,
+    "mobilenetv3_large": _build_mobilenetv3_large,
 }
 
-ModelName = Literal["simple_cnn", "resnet18", "mobilenetv2"]
+ModelName = Literal["simple_cnn", "resnet50", "mobilenetv3_large"]
 
 
 def build_model(

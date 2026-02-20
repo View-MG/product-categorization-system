@@ -10,7 +10,7 @@ Expected CSV columns (from prepare.py / validate.py pipeline):
     abs_path, label_coarse, split, barcode, img_ok, w, h, file_size
 
 Expected label_map.json format  (from prepare.py::attach_label_map):
-    {"beverages": 0, "snacks": 1, "dry_food": 2, "non_food": 3}
+    {"beverage": 0, "snack": 1}
 """
 
 import json
@@ -43,8 +43,9 @@ class ProductDataset(Dataset):
 
     Returns  (via __getitem__)
     -------
-    image  : torch.FloatTensor  shape (C, H, W) after transform
-    label  : torch.LongTensor   scalar integer class index
+    dict with keys:
+      "pixel_values" : torch.FloatTensor  shape (C, H, W) after transform
+      "labels"       : torch.LongTensor   scalar integer class index
     """
 
     def __init__(
@@ -63,6 +64,16 @@ class ProductDataset(Dataset):
             raise ValueError("manifest must contain column 'abs_path'")
         if "label_coarse" not in manifest.columns:
             raise ValueError("manifest must contain column 'label_coarse'")
+
+        # ── 1a. Remap and Filter to 2 classes ("snack", "beverage") ─────────────
+        def remap_label(lbl: str) -> str:
+            lbl = str(lbl).lower().strip()
+            if lbl in ["snacks", "snack"]: return "snack"
+            if lbl in ["beverages", "beverage"]: return "beverage"
+            return lbl
+
+        manifest["label_coarse"] = manifest["label_coarse"].apply(remap_label)
+        manifest = manifest[manifest["label_coarse"].isin(["snack", "beverage"])].copy()
 
         # ── 1b. Filter out corrupted images ───────────────────────────────
         if "img_ok" in manifest.columns:
@@ -103,10 +114,8 @@ class ProductDataset(Dataset):
         self._df = manifest.reset_index(drop=True)
 
         # ── 3. Load label_map ─────────────────────────────────────────────
-        if isinstance(label_map, (str, Path)):
-            label_map = json.loads(Path(label_map).read_text(encoding="utf-8"))
-
-        self._label_map: Dict[str, int] = label_map
+        # Ignore external label map and enforce 2 classes
+        self._label_map: Dict[str, int] = {"beverage": 0, "snack": 1}
 
         # Pre-validate that every label in manifest is known
         unknown = set(self._df["label_coarse"].unique()) - set(self._label_map.keys())
@@ -124,7 +133,7 @@ class ProductDataset(Dataset):
     def __len__(self) -> int:
         return len(self._df)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self._df.iloc[idx]
 
         # ── Load image (PIL, RGB) ────────────────────────────────────────
@@ -148,7 +157,7 @@ class ProductDataset(Dataset):
         label_int: int = self._label_map[row["label_coarse"]]
         label = torch.tensor(label_int, dtype=torch.long)
 
-        return image, label  # type: ignore[return-value]
+        return {"pixel_values": image, "labels": label}
 
     # ── Convenience helpers ───────────────────────────────────────────────
 
@@ -206,9 +215,8 @@ def build_datasets(
             manifest = manifest.drop(columns=["_tmp_bc"])
             manifest = manifest.dropna(subset=["split"])
 
-    label_map: Dict[str, int] = json.loads(
-        Path(label_map_path).read_text(encoding="utf-8")
-    )
+    # We don't need to load the json label_map anymore since Dataset forces the 2-class setup.
+    label_map = {"beverage": 0, "snack": 1}
 
     ds: Dict[str, ProductDataset] = {}
     for split_name in ("train", "val", "test"):

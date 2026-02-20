@@ -9,21 +9,24 @@ Purpose:
 
 Run examples
 -----------
-    python train.py --model resnet18
-    python train.py --model mobilenetv2 --epochs 30 --lr 5e-4
+    python train.py --model resnet50
+    python train.py --model mobilenetv3_large --epochs 30 --lr 5e-4
     python train.py --model simple_cnn  --no-freeze --epochs 25
-    python train.py --model resnet18    --device cpu
+    python train.py --model resnet50    --device cpu
 """
 
 import argparse
 import json
 import random
 import sys
+import re
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+
+from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
+from transformers import default_data_collator
 
 # ── Project root on sys.path (allows `python train.py` from repo root) ────────
 ROOT = Path(__file__).parent
@@ -34,7 +37,8 @@ from src.config.train_config import TrainConfig
 from src.data.dataset import build_datasets
 from src.data.transforms import get_train_transforms, get_val_transforms
 from src.models.factory import build_model, available_models
-from src.training.trainer import Trainer
+
+from sklearn.metrics import accuracy_score, f1_score
 
 
 # ── Reproducibility ───────────────────────────────────────────────────────────
@@ -45,6 +49,33 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+# ── Versioned Directory Helper ────────────────────────────────────────────────
+
+def get_next_run_dir(base_dir: Path, model_name: str) -> Path:
+    base_dir.mkdir(parents=True, exist_ok=True)
+    existing_tests = []
+    pattern = re.compile(rf"^{model_name}_test(\d+)$")
+    for item in base_dir.iterdir():
+        if item.is_dir():
+            match = pattern.match(item.name)
+            if match:
+                existing_tests.append(int(match.group(1)))
+    next_num = max(existing_tests) + 1 if existing_tests else 1
+    return base_dir / f"{model_name}_test{next_num}"
+
+
+# ── Metrics Helper ────────────────────────────────────────────────────────────
+
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+    preds = np.argmax(predictions, axis=-1)
+    acc = accuracy_score(labels, preds)
+    f1 = f1_score(labels, preds, average='macro')
+    return {"accuracy": acc, "f1_macro": f1}
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -59,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model",
         type=str,
-        default="resnet18",
+        default="resnet50",
         choices=available_models(),
         help="Architecture to train.",
     )
@@ -105,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs"),
+        default=Path("runs"),
         help="Root directory for run outputs.",
     )
 
@@ -151,9 +182,6 @@ def main() -> None:
             "  to generate the manifest before training."
         )
         sys.exit(1)
-    if not cfg.label_map.exists():
-        print(f"[ERROR] label_map not found: {cfg.label_map}")
-        sys.exit(1)
 
     # ── Datasets ──────────────────────────────────────────────────────────
     print("[train.py] Loading datasets …")
@@ -170,25 +198,7 @@ def main() -> None:
     print(f"  train : {train_ds}")
     print(f"  val   : {val_ds}")
 
-    class_names = train_ds.classes   # e.g. ["beverages", "dry_food", "non_food", "snacks"]
     num_classes = train_ds.num_classes
-
-    # ── DataLoaders ───────────────────────────────────────────────────────
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-    )
 
     # ── Model ─────────────────────────────────────────────────────────────
     print(f"[train.py] Building model: {cfg.model_name} …")
@@ -208,17 +218,48 @@ def main() -> None:
             f"frozen={ps['frozen']:,}"
         )
 
-    # ── Trainer ───────────────────────────────────────────────────────────
-    trainer = Trainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        cfg=cfg,
-        class_names=class_names,
+    # ── Trainer Base Directory ────────────────────────────────────────────
+    run_dir = get_next_run_dir(cfg.output_dir, cfg.model_name)
+    print(f"\n[train.py] Output directory for this run: {run_dir}\n")
+
+    # ── Hugging Face Trainer ──────────────────────────────────────────────
+    training_args = TrainingArguments(
+        output_dir=str(run_dir),
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        logging_strategy="epoch",
+        learning_rate=cfg.lr,
+        per_device_train_batch_size=cfg.batch_size,
+        per_device_eval_batch_size=cfg.batch_size,
+        num_train_epochs=cfg.epochs,
+        weight_decay=cfg.weight_decay,
+        load_best_model_at_end=True,
+        metric_for_best_model="f1_macro",
+        greater_is_better=True,
+        dataloader_num_workers=cfg.num_workers,
+        seed=cfg.seed,
     )
 
-    trainer.fit()
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        compute_metrics=compute_metrics,
+        data_collator=default_data_collator,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+    )
 
+    print("[train.py] Starting Hugging Face Trainer loop ...")
+    trainer.train()
+
+    # Save the best model officially to the top level of the run directory
+    trainer.save_model(str(run_dir / "best_model"))
+    
+    # Save metrics history
+    with open(run_dir / "metrics.json", "w") as f:
+        json.dump(trainer.state.log_history, f, indent=2)
+    print(f"\n[train.py] Training complete! Results saved in {run_dir}")
 
 if __name__ == "__main__":
     main()

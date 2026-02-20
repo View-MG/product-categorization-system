@@ -27,7 +27,7 @@ class DataConfig:
     raw_metadata_name: str = "metadata.csv"
 
     # --- Labels ---
-    labels: List[str] = field(default_factory=lambda: ["beverages", "snacks", "dry_food", "non_food"])
+    labels: List[str] = field(default_factory=lambda: ["beverage", "snack"])
     dedup_by_barcode: bool = False
     cap_per_label: Optional[int] = None
     
