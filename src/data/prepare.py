@@ -76,8 +76,6 @@ def add_paths(df: pd.DataFrame, raw_dir: Path) -> pd.DataFrame:
         .str.lstrip("/")                     # force relative
     )
 
-    out["image_path"] = rel
-
     # abs_path for validation (OS-specific)
     rel_os = rel.str.replace("/", os.sep, regex=False).str.lstrip("\\/")
     out["abs_path"] = rel_os.map(lambda r: str(images_dir / r) if r else "")
@@ -103,17 +101,16 @@ def basic_clean(
     """
     out = df.copy()
 
-    for col in ["barcode", "image_path", "abs_path", "label_coarse"]:
+    for col in ["barcode", "abs_path", "label_coarse"]:
         if col not in out.columns:
             raise ValueError(f"metadata must contain {col}")
 
     out["label_coarse"] = out["label_coarse"].astype("string").fillna("").str.strip()
     out["barcode"] = out["barcode"].astype("string").fillna("").str.strip()
-    out["image_path"] = out["image_path"].astype("string").fillna("").str.strip()
     out["abs_path"] = out["abs_path"].astype("string").fillna("").str.strip()
 
     # remove empty required fields
-    out = out[(out["barcode"] != "") & (out["image_path"] != "") & (out["abs_path"] != "") & (out["label_coarse"] != "")]
+    out = out[(out["barcode"] != "") & (out["abs_path"] != "") & (out["label_coarse"] != "")]
 
     if labels:
         out = out[out["label_coarse"].isin(labels)]
