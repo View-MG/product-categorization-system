@@ -1,3 +1,12 @@
+"""
+src/data/split.py
+
+Purpose:
+- Perform barcode-level (group) splitting to avoid data leakage.
+- Save split metadata as JSON.
+- Validate split integrity (a barcode must not appear in multiple splits).
+"""
+
 import json
 from dataclasses import dataclass
 from pathlib import Path

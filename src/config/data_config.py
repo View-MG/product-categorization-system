@@ -1,9 +1,8 @@
 """
-data_config.py
+src/config/data_config.py
 
 Purpose:
-- Hold static configuration for dataset preparation.
-- Only secret read from environment is HF_TOKEN.
+- Hold configuration for dataset preparation.
 """
 
 from dataclasses import dataclass, field
@@ -27,7 +26,8 @@ class DataConfig:
     processed_dirname: str = "processed"
     raw_metadata_name: str = "metadata.csv"
 
-    labels: List[str] = field(default_factory=lambda: ["beverages", "snacks", "dry_food", "other"])
+    # --- Labels ---
+    labels: List[str] = field(default_factory=lambda: ["beverages", "snacks", "dry_food", "personal_item", "other"])
     dedup_by_barcode: bool = False
     cap_per_label: Optional[int] = None
     
