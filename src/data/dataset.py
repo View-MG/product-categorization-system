@@ -55,6 +55,7 @@ class ProductDataset(Dataset):
         transform: Optional[Callable] = None,
     ) -> None:
         # ── 1. Load manifest ──────────────────────────────────────────────
+        manifest_path = manifest if isinstance(manifest, (str, Path)) else None
         if isinstance(manifest, (str, Path)):
             manifest = pd.read_csv(manifest)
 
@@ -66,11 +67,27 @@ class ProductDataset(Dataset):
         # ── 2. Filter by split ────────────────────────────────────────────
         if split is not None:
             if "split" not in manifest.columns:
-                raise ValueError(
-                    f"split='{split}' requested but manifest has no 'split' column. "
-                    "Run scripts/prepare_dataset.py first."
-                )
-            manifest = manifest[manifest["split"] == split].copy()
+                if manifest_path is not None:
+                    splits_path = Path(manifest_path).parent / "splits.json"
+                    if splits_path.exists():
+                        splits_data = json.loads(splits_path.read_text(encoding="utf-8"))
+                        barcodes = set(splits_data.get("splits", {}).get(split, []))
+                        
+                        # We need 'barcode' as a string without '.0' etc
+                        # Pandas sometimes reads big numbers as float if there are NaNs
+                        manifest["_tmp_bc"] = manifest.get("barcode", "").astype(str).str.replace(r"\.0$", "", regex=True)
+                        manifest = manifest[manifest["_tmp_bc"].isin(barcodes)].copy()
+                        manifest = manifest.drop(columns=["_tmp_bc"])
+                    else:
+                        raise ValueError(f"split '{split}' requested, no 'split' column, and no splits.json found at {splits_path}")
+                else:
+                    raise ValueError(
+                        f"split='{split}' requested but manifest has no 'split' column. "
+                        "Run scripts/prepare_dataset.py first."
+                    )
+            else:
+                manifest = manifest[manifest["split"] == split].copy()
+                
             if len(manifest) == 0:
                 raise ValueError(
                     f"No rows found for split='{split}'. "
@@ -168,6 +185,21 @@ def build_datasets(
     >>> datasets["train"], datasets["val"], datasets["test"]
     """
     manifest = pd.read_csv(manifest_path)
+    
+    if "split" not in manifest.columns:
+        splits_path = Path(manifest_path).parent / "splits.json"
+        if splits_path.exists():
+            splits_data = json.loads(splits_path.read_text(encoding="utf-8"))
+            barcode_to_split = {}
+            for sp, bcs in splits_data.get("splits", {}).items():
+                for bc in bcs:
+                    barcode_to_split[str(bc)] = sp
+            
+            manifest["_tmp_bc"] = manifest.get("barcode", "").astype(str).str.replace(r"\.0$", "", regex=True)
+            manifest["split"] = manifest["_tmp_bc"].map(barcode_to_split)
+            manifest = manifest.drop(columns=["_tmp_bc"])
+            manifest = manifest.dropna(subset=["split"])
+
     label_map: Dict[str, int] = json.loads(
         Path(label_map_path).read_text(encoding="utf-8")
     )

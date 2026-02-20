@@ -89,8 +89,8 @@ images/
 ```text
 product-categorization-system/
 ├── data_local/
-│   ├── raw_extracted/data_v1/     ← extracted tar (images + metadata.csv)
-│   └── processed/data_v1/        ← manifest_clean.csv, label_map.json, splits.json, stats.json
+│   ├── raw_extracted/data_v2/     ← extracted tar (images + metadata.csv)
+│   └── processed/data_v2/        ← manifest_clean.csv, label_map.json, splits.json, stats.json
 ├── scripts/
 │   └── prepare_dataset.py        ← end-to-end data preparation pipeline
 ├── src/
@@ -181,12 +181,12 @@ python scripts/prepare_dataset.py
 
 This will:
 
-1. Download `data_v1.tar` from the Hugging Face dataset repository
-2. Extract images and `metadata.csv` to `data_local/raw_extracted/data_v1/`
+1. Download `data_v2.tar` from the Hugging Face dataset repository
+2. Extract images and `metadata.csv` to `data_local/raw_extracted/data_v2/`
 3. Clean and validate metadata
 4. Validate images (remove broken / too-small files)
 5. Split data by barcode (group split, no leakage) into train / val / test
-6. Save outputs to `data_local/processed/data_v1/`:
+6. Save outputs to `data_local/processed/data_v2/`:
    - `manifest_clean.csv`
    - `label_map.json`
    - `splits.json`

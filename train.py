@@ -76,13 +76,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--manifest",
         type=Path,
-        default=Path("data_local/processed/data_v1/manifest_clean.csv"),
+        default=Path("data_local/processed/data_v2/manifest_clean.csv"),
         help="Path to manifest_clean.csv.",
     )
     p.add_argument(
         "--label-map",
         type=Path,
-        default=Path("data_local/processed/data_v1/label_map.json"),
+        default=Path("data_local/processed/data_v2/label_map.json"),
         help="Path to label_map.json.",
     )
 

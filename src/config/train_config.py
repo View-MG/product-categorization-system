@@ -31,8 +31,8 @@ class TrainConfig:
     """Dropout probability applied in the classification head."""
 
     # ── Data paths ────────────────────────────────────────────────────────
-    manifest: Path = Path("data_local/processed/data_v1/manifest_clean.csv")
-    label_map: Path = Path("data_local/processed/data_v1/label_map.json")
+    manifest: Path = Path("data_local/processed/data_v2/manifest_clean.csv")
+    label_map: Path = Path("data_local/processed/data_v2/label_map.json")
 
     # ── Training hyper-parameters ─────────────────────────────────────────
     epochs: int = 20

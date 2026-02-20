@@ -19,8 +19,8 @@ import numpy as np
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-MANIFEST  = ROOT / "data_local/processed/data_v1/manifest_clean.csv"
-LABEL_MAP = ROOT / "data_local/processed/data_v1/label_map.json"
+MANIFEST  = ROOT / "data_local/processed/data_v2/manifest_clean.csv"
+LABEL_MAP = ROOT / "data_local/processed/data_v2/label_map.json"
 
 PASS = "\033[92m PASS\033[0m"
 FAIL = "\033[91m FAIL\033[0m"
@@ -87,7 +87,7 @@ check("val transform produces identical outputs (deterministic)",
 # ── 4. Label map ──────────────────────────────────────────────────────────────
 print("\n── 4. Label map ──────────────────────────────────────────────────────")
 label_map: dict = json.loads(LABEL_MAP.read_text())
-expected_classes = {"beverages", "snacks", "dry_food", "other"}
+expected_classes = {"beverages", "snacks", "dry_food", "non_food"}
 check("label_map has exactly 4 classes",        len(label_map) == 4, str(set(label_map)))
 check("label_map keys match expected classes",  set(label_map) == expected_classes,
       str(set(label_map)))
