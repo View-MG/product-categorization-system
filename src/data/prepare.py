@@ -1,44 +1,86 @@
-import re
-from pathlib import Path
-from typing import Optional, Tuple
+"""
+src/data/prepare.py
+
+Purpose:
+- Load metadata from CSV.
+- Normalize barcode.
+- Build image_path (relative) and abs_path (for validation).
+- Basic cleaning (required fields, label filtering, dedup, cap).
+- Build train-ready manifest by:
+  - dropping unwanted columns
+  - removing rows with "" in required fields
+"""
 
 import os
+import re
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
+MANIFEST_DROP_COLS = ["image_id","split", "img_ok", "w", "h", "file_size", "image_url", "source", "license_db", "license_images"]
+
 
 def norm_barcode(x: object) -> str:
+    """
+    Normalize a barcode into a 13-digit numeric string.
+
+    Why:
+    - OFF codes can include non-digits or inconsistent formatting.
+    - We strip non-digits and zero-pad to 13 digits for consistent grouping/splitting.
+    """
     s = re.sub(r"\D", "", str(x or ""))
     return s.zfill(13) if s else ""
 
 
 def load_metadata(meta_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(meta_path)
-    return df
+    """Load metadata from CSV into a DataFrame."""
+    return pd.read_csv(meta_path)
 
 
 def add_paths(df: pd.DataFrame, raw_dir: Path) -> pd.DataFrame:
+    """
+    Create:
+    - image_path: relative path used by training/data loader (portable)
+    - abs_path: absolute local path used by validate_images()
+
+    Notes:
+    - If metadata has image_id, we convert it to image_path.
+    - Base directory is raw_dir/images if exists, otherwise raw_dir.
+    """
     raw_dir = Path(raw_dir)
     images_dir = raw_dir / "images"
     if not images_dir.exists():
         images_dir = raw_dir
 
-    df = df.copy()
-    df["barcode"] = df["barcode"].map(norm_barcode)
-    df["image_id"] = df["image_id"].astype("string").fillna("").str.strip()
+    out = df.copy()
 
-    # ทำให้ "/" กลายเป็น separator ของเครื่อง + กันเคสขึ้นต้นด้วย / หรือ \
+    # barcode
+    out["barcode"] = out.get("barcode", "").map(norm_barcode)
+
+    # image_path (prefer existing image_path, fallback to image_id)
+    if "image_path" in out.columns:
+        src = out["image_path"]
+    elif "image_id" in out.columns:
+        src = out["image_id"]
+    else:
+        raise ValueError("metadata must contain image_id or image_path")
+
+    # normalize to a clean RELATIVE path
     rel = (
-        df["image_id"]
-        .str.replace("/", os.sep, regex=False)
-        .str.lstrip("\\/")
+        src.astype("string")
+        .fillna("")
+        .str.strip()
+        .str.replace("\\", "/", regex=False)  # unify
+        .str.lstrip("/")                     # force relative
     )
 
-    df["abs_path"] = rel.map(lambda r: str(images_dir / r))
+    # abs_path for validation (OS-specific)
+    rel_os = rel.str.replace("/", os.sep, regex=False).str.lstrip("\\/")
+    out["abs_path"] = rel_os.map(lambda r: str(images_dir / r) if r else "")
 
-    return df
-
+    return out
 
 
 def basic_clean(
@@ -48,40 +90,76 @@ def basic_clean(
     cap_per_label: Optional[int] = None,
     seed: int = 42,
 ) -> pd.DataFrame:
-    df = df.copy()
+    """
+    Basic cleaning:
+    - Ensure required columns exist
+    - Remove empty required fields
+    - Optional label filtering
+    - Drop duplicates by abs_path
+    - dedup by barcode (keep 1 image per product)
+    - cap per label
+    """
+    out = df.copy()
 
-    if "label_coarse" not in df.columns:
-        raise ValueError("metadata must contain label_coarse")
+    for col in ["barcode", "abs_path", "label_coarse"]:
+        if col not in out.columns:
+            raise ValueError(f"metadata must contain {col}")
 
-    df["label_coarse"] = df["label_coarse"].astype(str).str.strip()
+    out["label_coarse"] = out["label_coarse"].astype("string").fillna("").str.strip()
+    
+    # Remap labels to handle plural forms from raw data before filtering
+    def remap_label(lbl: str) -> str:
+        lbl = lbl.lower()
+        if lbl in ["snacks", "snack"]: return "snack"
+        if lbl in ["beverages", "beverage"]: return "beverage"
+        return lbl
+        
+    out["label_coarse"] = out["label_coarse"].apply(remap_label)
 
-    df = df[df["barcode"].astype(str).str.len() > 0]
-    df = df[df["image_id"].astype(str).str.len() > 0]
-    df = df[df["abs_path"].astype(str).str.len() > 0]
+    out["barcode"] = out["barcode"].astype("string").fillna("").str.strip()
+    out["abs_path"] = out["abs_path"].astype("string").fillna("").str.strip()
+
+    # remove empty required fields
+    out = out[(out["barcode"] != "") & (out["abs_path"] != "") & (out["label_coarse"] != "")]
 
     if labels:
-        df = df[df["label_coarse"].isin(labels)]
+        out = out[out["label_coarse"].isin(labels)]
 
-    df = df.drop_duplicates(subset=["abs_path"], keep="first")
+    out = out.drop_duplicates(subset=["abs_path"], keep="first")
 
     if dedup_by_barcode:
-        df = df.sort_values(["barcode", "label_coarse", "image_id"])
-        df = df.drop_duplicates(subset=["barcode"], keep="first")
+        out = out.sort_values(["barcode", "label_coarse", "image_path"])
+        out = out.drop_duplicates(subset=["barcode"], keep="first")
 
     if cap_per_label is not None:
         rng = np.random.default_rng(seed)
         kept = []
-        for lbl, g in df.groupby("label_coarse"):
+        for lbl, g in out.groupby("label_coarse"):
             if len(g) <= cap_per_label:
                 kept.append(g)
             else:
                 idx = rng.choice(g.index.to_numpy(), size=cap_per_label, replace=False)
-                kept.append(df.loc[idx])
-        df = pd.concat(kept, ignore_index=True)
+                kept.append(out.loc[idx])
+        out = pd.concat(kept, ignore_index=True)
 
-    df = df.reset_index(drop=True)
-    return df
+    return out.reset_index(drop=True)
 
 
 def attach_label_map(labels: list) -> dict:
+    """Create label -> integer id mapping."""
     return {lbl: i for i, lbl in enumerate(labels)}
+
+
+def build_manifest(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the final train-ready manifest:
+    - drop all columns except MANIFEST_CLEAN_COLS (drop-columns approach)
+    """
+    out = df.copy()
+
+    # drop everything else (this is the "drop columns" approach)
+    drop_cols = [c for c in MANIFEST_DROP_COLS if c in out.columns]
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+        
+    return out.reset_index(drop=True)

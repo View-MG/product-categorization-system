@@ -1,9 +1,10 @@
 """
-loader.py
+src/data/loader.py
 
 Purpose:
-- Download a raw tar from Hugging Face.
-- Extract tar safely and cache extraction by a marker file.
+- Download a raw .tar file from Hugging Face Hub.
+- Extract tar safely (path traversal protection).
+- Cache extraction with a marker file to avoid repeated work.
 """
 
 import os
@@ -15,6 +16,13 @@ from huggingface_hub import hf_hub_download
 
 
 def _extract_tar(tar_path: Path, out_dir: Path) -> None:
+    """
+    Safely extract a tar archive into out_dir.
+
+    Security best practice:
+    - Prevent path traversal by ensuring every extracted path stays under out_dir.
+    """
+    
     out_dir.mkdir(parents=True, exist_ok=True)
     base = out_dir.resolve()
 
@@ -34,6 +42,13 @@ def download_raw_tar(
     revision: Optional[str] = None,
     token: Optional[str] = None,
 ) -> Path:
+    """
+    Download a file from Hugging Face Hub (cached by hf_hub_download).
+
+    Token behavior:
+    - If token is None, tries environment variable HF_TOKEN.
+    - If still None, hf_hub_download may work for public repos.
+    """
     return Path(
         hf_hub_download(
             repo_id=repo_id,
@@ -46,6 +61,9 @@ def download_raw_tar(
 
 
 def ensure_extracted(raw_tar: Path, extract_dir: Path) -> None:
+    """
+    Extract raw_tar into extract_dir only once using a marker file.
+    """
     marker = extract_dir / ".extracted.ok"
     if marker.exists():
         return

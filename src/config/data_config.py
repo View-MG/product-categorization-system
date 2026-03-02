@@ -1,9 +1,8 @@
 """
-data_config.py
+src/config/data_config.py
 
 Purpose:
-- Hold static configuration for dataset preparation.
-- Only secret read from environment is HF_TOKEN.
+- Hold configuration for dataset preparation.
 """
 
 from dataclasses import dataclass, field
@@ -17,7 +16,7 @@ class DataConfig:
     # --- Hugging Face settings ---
     repo_id: str = "Phathanan/product-categorization-system"
     repo_type: str = "dataset"
-    raw_tar_in_repo: str = "data/raw/data_v1.tar"
+    raw_tar_in_repo: str = "data/raw/data_v2.tar"
     token: Optional[str] = None
     revision: Optional[str] = None
 
@@ -27,7 +26,8 @@ class DataConfig:
     processed_dirname: str = "processed"
     raw_metadata_name: str = "metadata.csv"
 
-    labels: List[str] = field(default_factory=lambda: ["beverages", "snacks", "dry_food", "other"])
+    # --- Labels ---
+    labels: List[str] = field(default_factory=lambda: ["beverage", "snack"])
     dedup_by_barcode: bool = False
     cap_per_label: Optional[int] = None
     

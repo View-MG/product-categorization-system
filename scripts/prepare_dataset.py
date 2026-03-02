@@ -1,15 +1,26 @@
 """
-prepare_dataset.py
+scripts/prepare_dataset.py
 
 Purpose:
-- Build a clean image classification manifest from a raw tar (downloaded from Hugging Face or local file).
-- Validate images, remove broken/too-small images, then split data by barcode (group split) to avoid leakage.
-- Export: manifest_clean.csv, splits.json, label_map.json, stats.json
+- End-to-end dataset preparation pipeline for image classification.
+- Downloads a raw .tar from Hugging Face, extracts it, loads metadata.csv,
+  canonicalizes columns, cleans rows, validates images, and performs a barcode-level split
+  to avoid data leakage.
+
+Outputs (under data_local/processed/<tar_stem>/):
+- manifest_clean.csv  : minimal manifest for training/testing
+- metadata_min.csv    : minimal metadata (barcode, product_name, categories_tags_en)
+- splits.json         : split assignment by barcode (reproducible)
+- label_map.json      : label -> integer id mapping
+- stats.json          : dataset summary statistics
 """
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd
 
@@ -17,18 +28,24 @@ from dotenv import load_dotenv
 
 from src.config.data_config import DataConfig
 from src.data.loader import download_raw_tar, ensure_extracted
-from src.data.prepare import load_metadata, add_paths, basic_clean, attach_label_map
+from src.data.prepare import load_metadata, add_paths, basic_clean, attach_label_map, build_manifest
 from src.data.validate import validate_images, keep_only_ok
 from src.data.split import SplitConfig, split_by_barcode, save_splits_json
 from src.data.stats import compute_stats, save_stats
 
 def main() -> None:
+    """
+    Run the full preparation pipeline.
+    """
+    
     cfg = DataConfig()
 
+    # --- Build paths and ensure output dirs exist ---
     p = cfg.paths()
     p["raw_dir"].mkdir(parents=True, exist_ok=True)
     p["proc_dir"].mkdir(parents=True, exist_ok=True)
 
+    # --- Download + extract raw dataset tar ---
     raw_tar = download_raw_tar(
         repo_id=cfg.repo_id,
         path_in_repo=cfg.raw_tar_in_repo,
@@ -70,7 +87,8 @@ def main() -> None:
     )
     df, split_meta = split_by_barcode(df, split_cfg)
 
-    df.to_csv(p["manifest_clean"], index=False)
+    manifest = build_manifest(df)
+    manifest.to_csv(p["manifest_clean"], index=False)
     save_splits_json(split_meta, p["splits"])
 
     label_map = attach_label_map(cfg.labels)
