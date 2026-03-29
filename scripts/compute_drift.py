@@ -1,347 +1,376 @@
-from __future__ import annotations
-
+import base64
+import io
 import json
 import sqlite3
-from typing import Any, Dict, List
+from collections import Counter
+from pathlib import Path
 
 import numpy as np
-
-DB_PATH = "monitoring.db"
-REFERENCE_STATS_PATH = "reference_stats.json"
-REFERENCE_EMBEDDINGS_PATH = "reference_embeddings.npz"
-LATEST_N = 100
-EPS = 1e-8
-
-
-def get_conn(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+import torch
+import torch.nn as nn
+from PIL import Image
+from safetensors.torch import load_file
+from torchvision import transforms
+from torchvision.models import convnext_tiny
 
 
-def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
+DB_PATH = Path("data/monitoring.db")
+REFERENCE_STATS_PATH = Path("reference/reference_stats.json")
+REFERENCE_EMBEDDINGS_PATH = Path("reference/reference_embeddings.npz")
+
+CHECKPOINT_PATH = Path("model.safetensors")
+
+WINDOW_SIZE = 100
+BATCH_SIZE = 32
+
+EMBEDDING_THRESHOLD = 1.95
+CONFIDENCE_THRESHOLD = 0.25
+CLASS_THRESHOLD = 0.1
 
 
-def get_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {row["name"] for row in rows}
+class ConvNextTinyWithEmbedding(nn.Module):
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.backbone = convnext_tiny(weights=None)
+        in_features = self.backbone.classifier[2].in_features
+        self.backbone.classifier[2] = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(in_features, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.backbone.features(x)
+        x = self.backbone.avgpool(x)
+        x = self.backbone.classifier[0](x)
+        embedding = torch.flatten(x, 1)
+        logits = self.backbone.classifier[2](embedding)
+        return logits, embedding
+
+def build_model(num_classes: int):
+    model = ConvNextTinyWithEmbedding(num_classes=num_classes)
+    
+    weights = load_file(str(CHECKPOINT_PATH), device="cpu")
+
+    backbone_weights = {}
+    for k, v in weights.items():
+        if k.startswith("_backbone."):
+            new_key = "backbone." + k[len("_backbone."):]
+            backbone_weights[new_key] = v
+
+    if not backbone_weights:
+        raise ValueError("No keys starting with '_backbone.' were found in model.safetensors")
+
+    missing_keys, unexpected_keys = model.load_state_dict(backbone_weights, strict=False)
+
+    print("missing_keys =", missing_keys)
+    print("unexpected_keys =", unexpected_keys)
+
+    model.eval()
+    return model
 
 
-def load_reference_stats(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+def build_transform(input_size: int, mean: list[float], std: list[float]):
+    return transforms.Compose([
+        transforms.Resize((input_size, input_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
+
+def load_reference_stats():
+    with open(REFERENCE_STATS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def load_reference_embeddings(path: str) -> np.ndarray:
-    data = np.load(path, allow_pickle=True)
+def load_reference_embedding_mean(ref_stats: dict):
+    raw_mean = ref_stats.get("embedding_stats", {}).get("mean")
+
+    if isinstance(raw_mean, list):
+        ref_mean = np.asarray(raw_mean, dtype=np.float32)
+        if ref_mean.ndim == 1 and ref_mean.size > 0:
+            return ref_mean
+        
+    data = np.load(REFERENCE_EMBEDDINGS_PATH, allow_pickle=True)
 
     if "embeddings" in data:
-        embeddings = data["embeddings"]
-    elif "sample_embeddings" in data:
-        embeddings = data["sample_embeddings"]
+        ref_embeddings = data["embeddings"]
     else:
-        first_key = list(data.files)[0]
-        embeddings = data[first_key]
+        ref_embeddings = data[data.files[0]]
 
-    embeddings = np.asarray(embeddings, dtype=np.float32)
-    if embeddings.ndim != 2:
-        raise ValueError("reference embeddings must be 2D")
-    return embeddings
+    ref_embeddings = np.asarray(ref_embeddings, dtype=np.float32)
+    
+    return ref_embeddings.mean(axis=0)
 
+def decode_image_data_url(image_data_url: str) -> Image.Image:
+    if not image_data_url:
+        raise ValueError("image_data_url is empty")
 
-def fetch_latest_prediction_ids(conn: sqlite3.Connection, n: int) -> List[int]:
+    if "," not in image_data_url:
+        raise ValueError("invalid image_data_url format")
+
+    _, encoded = image_data_url.split(",", 1)
+    image_bytes = base64.b64decode(encoded)
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return image
+
+def normalize_label(name: str) -> str:
+    s = str(name).strip().lower()
+    mapping = {
+        "beverage": "beverage",
+        "beverages": "beverage",
+        "snack": "snack",
+        "snacks": "snack",
+    }
+    if s not in mapping:
+        raise ValueError(f"invalid class label: {name}")
+    return mapping[s]
+
+def load_n_latest_predictions(window_size: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(prediction_events)").fetchall()
+    }
+
+    required = {"id", "predicted_class", "confidence", "image_data_url"}
+    missing = required - columns
+    if missing:
+        conn.close()
+        raise ValueError(f"prediction_events missing columns: {missing}")
+
     rows = conn.execute(
         """
-        SELECT id
+        SELECT id, predicted_class, confidence, image_data_url
         FROM prediction_events
+        WHERE image_data_url IS NOT NULL
+          AND TRIM(image_data_url) != ''
         ORDER BY id DESC
         LIMIT ?
         """,
-        (n,),
+        (window_size,),
     ).fetchall()
-    ids = [int(row["id"]) for row in rows]
-    ids.reverse()
-    return ids
 
+    conn.close()
 
-def fetch_prediction_rows_by_ids(conn: sqlite3.Connection, prediction_ids: List[int]) -> List[sqlite3.Row]:
-    if not prediction_ids:
-        return []
-
-    placeholders = ",".join("?" for _ in prediction_ids)
-    rows = conn.execute(
-        f"""
-        SELECT id, predicted_class, confidence, timestamp
-        FROM prediction_events
-        WHERE id IN ({placeholders})
-        ORDER BY id ASC
-        """,
-        prediction_ids,
-    ).fetchall()
-    return rows
-
-
-def parse_embedding_json(embedding_json: str) -> np.ndarray:
-    arr = np.asarray(json.loads(embedding_json), dtype=np.float32)
-    if arr.ndim != 1:
-        raise ValueError("embedding must be a 1D vector")
-    return arr
-
-
-def fetch_embeddings_for_prediction_ids(conn: sqlite3.Connection, prediction_ids: List[int]) -> np.ndarray:
-    if not prediction_ids:
-        raise ValueError("prediction_ids is empty")
-
-    embedding_map: Dict[int, np.ndarray] = {}
-
-    if table_exists(conn, "prediction_embeddings"):
-        placeholders = ",".join("?" for _ in prediction_ids)
-        rows = conn.execute(
-            f"""
-            SELECT prediction_id, embedding_json
-            FROM prediction_embeddings
-            WHERE prediction_id IN ({placeholders})
-            """,
-            prediction_ids,
-        ).fetchall()
-
-        for row in rows:
-            embedding_map[int(row["prediction_id"])] = parse_embedding_json(row["embedding_json"])
-
-    elif "embedding_json" in get_table_columns(conn, "prediction_events"):
-        placeholders = ",".join("?" for _ in prediction_ids)
-        rows = conn.execute(
-            f"""
-            SELECT id, embedding_json
-            FROM prediction_events
-            WHERE id IN ({placeholders})
-            """,
-            prediction_ids,
-        ).fetchall()
-
-        for row in rows:
-            if row["embedding_json"] is not None:
-                embedding_map[int(row["id"])] = parse_embedding_json(row["embedding_json"])
-    else:
+    if len(rows) < window_size:
         raise ValueError(
-            "No embedding storage found. Need either prediction_embeddings table "
-            "or prediction_events.embedding_json column."
+            f"not enough prediction rows: need {window_size}, got {len(rows)}"
         )
 
-    ordered = []
-    for prediction_id in prediction_ids:
-        if prediction_id not in embedding_map:
-            raise ValueError(f"missing embedding for prediction_id={prediction_id}")
-        ordered.append(embedding_map[prediction_id])
+    rows = rows[::-1]
 
-    embeddings = np.stack(ordered, axis=0).astype(np.float32)
-    if embeddings.ndim != 2:
-        raise ValueError("current embeddings must be 2D")
-    return embeddings
+    ids = [int(r["id"]) for r in rows]
+    classes = [normalize_label(r["predicted_class"]) for r in rows]
+    confidences = np.array([float(r["confidence"]) for r in rows], dtype=np.float32)
+    image_data_urls = [str(r["image_data_url"]) for r in rows]
 
+    if np.any(confidences < 0.0) or np.any(confidences > 1.0):
+        raise ValueError("confidence must be between 0 and 1")
 
-def compute_hist_probs(values: List[float], bin_edges: List[float]) -> np.ndarray:
-    hist, _ = np.histogram(values, bins=np.asarray(bin_edges, dtype=np.float64))
-    probs = hist.astype(np.float64)
-    probs = probs / max(probs.sum(), 1.0)
-    probs = np.clip(probs, EPS, None)
-    probs = probs / probs.sum()
-    return probs
+    for image_data_url in image_data_urls:
+        if not image_data_url:
+            raise ValueError("some rows have empty image_data_url")
+
+    return ids, classes, confidences, image_data_urls
 
 
-def compute_psi(current_values: List[float], ref_bin_edges: List[float], ref_bin_probs: List[float]) -> float:
-    current_probs = compute_hist_probs(current_values, ref_bin_edges)
-    ref_probs = np.asarray(ref_bin_probs, dtype=np.float64)
-    ref_probs = np.clip(ref_probs, EPS, None)
-    ref_probs = ref_probs / ref_probs.sum()
 
-    if len(ref_probs) != len(current_probs):
-        raise ValueError("reference confidence bin_probs length mismatch")
+def infer_recent_embeddings(
+    model: nn.Module,
+    image_data_urls: list[str],
+    transform,
+    device: torch.device,
+    batch_size: int = 32,
+):
+    all_embeddings = []
 
-    psi = np.sum((ref_probs - current_probs) * np.log(ref_probs / current_probs))
+    for start in range(0, len(image_data_urls), batch_size):
+        batch_urls = image_data_urls[start:start + batch_size]
+        batch_tensors = []
+
+        for image_data_url in batch_urls:
+            image = decode_image_data_url(image_data_url)
+            tensor = transform(image)
+            batch_tensors.append(tensor)
+
+        x = torch.stack(batch_tensors).to(device)
+
+        with torch.no_grad():
+            _, embeddings = model(x)
+
+        all_embeddings.append(embeddings.cpu().numpy().astype(np.float32))
+
+    return np.concatenate(all_embeddings, axis=0)
+
+
+def compute_embedding_drift(ref_mean: np.ndarray, recent_embeddings: np.ndarray) -> float:
+    # Part: Embedding Drift
+    # สูตรที่ใช้คือ L2 distance ระหว่าง mean embedding ของ reference กับ mean embedding ของ window ล่าสุด
+    recent_mean = recent_embeddings.mean(axis=0)
+    return float(np.linalg.norm(recent_mean - ref_mean))
+
+
+def compute_psi(expected_probs: np.ndarray, actual_probs: np.ndarray, eps: float = 1e-8) -> float:
+    expected_probs = np.asarray(expected_probs, dtype=np.float64)
+    actual_probs = np.asarray(actual_probs, dtype=np.float64)
+
+    expected_probs = np.clip(expected_probs, eps, None)
+    actual_probs = np.clip(actual_probs, eps, None)
+
+    expected_probs = expected_probs / expected_probs.sum()
+    actual_probs = actual_probs / actual_probs.sum()
+
+    psi = np.sum((actual_probs - expected_probs) * np.log(actual_probs / expected_probs))
     return float(psi)
 
 
-def class_probs_from_labels(classes: List[str], labels: List[str]) -> np.ndarray:
-    counts = {label: 0 for label in labels}
-    for c in classes:
-        if c in counts:
-            counts[c] += 1
+def compute_confidence_drift(ref_stats: dict, recent_confidences: np.ndarray) -> float:
+    # Part: Confidence Drift
+    # สูตรที่ใช้คือ PSI เปรียบเทียบ distribution ของ confidence
+    conf_hist = ref_stats["confidence_histogram"]
 
-    probs = np.asarray([counts[label] for label in labels], dtype=np.float64)
-    probs = probs / max(probs.sum(), 1.0)
-    probs = np.clip(probs, EPS, None)
-    probs = probs / probs.sum()
-    return probs
+    bin_edges = np.asarray(conf_hist["bin_edges"], dtype=np.float32)
+    ref_counts = np.asarray(conf_hist["counts"], dtype=np.float32)
+
+    clipped = np.clip(
+        recent_confidences,
+        bin_edges[0] + 1e-6,
+        bin_edges[-1] - 1e-6,
+    )
+
+    recent_counts, _ = np.histogram(clipped, bins=bin_edges)
+
+    ref_probs = ref_counts / ref_counts.sum()
+    recent_probs = recent_counts / recent_counts.sum()
+
+    return compute_psi(ref_probs, recent_probs)
 
 
-def kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
-    p = np.clip(p, EPS, None)
-    q = np.clip(q, EPS, None)
+def kl_divergence(p: np.ndarray, q: np.ndarray, eps: float = 1e-8) -> float:
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+
+    p = np.clip(p, eps, None)
+    q = np.clip(q, eps, None)
+
     p = p / p.sum()
     q = q / q.sum()
-    return float(np.sum(p * np.log(p / q)))
+
+    return float(np.sum(p * np.log2(p / q)))
 
 
-def compute_jsd(current_classes: List[str], labels: List[str], ref_probs_dict: Dict[str, float]) -> float:
-    p = np.asarray([float(ref_probs_dict.get(label, 0.0)) for label in labels], dtype=np.float64)
-    p = np.clip(p, EPS, None)
+def compute_jsd(p: np.ndarray, q: np.ndarray) -> float:
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+
     p = p / p.sum()
+    q = q / q.sum()
 
-    q = class_probs_from_labels(current_classes, labels)
     m = 0.5 * (p + q)
-
-    jsd = 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
-    return float(jsd)
+    return 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
 
 
-def compute_embedding_score(
-    current_embeddings: np.ndarray,
-    reference_embeddings: np.ndarray,
-    ref_stats: Dict[str, Any],
-) -> float:
-    if current_embeddings.shape[1] != reference_embeddings.shape[1]:
-        raise ValueError("embedding dimension mismatch")
+def compute_class_ratio_drift(ref_stats: dict, recent_classes: list[str]) -> float:
+    # Part: Class Ratio Drift
+    # สูตรที่ใช้คือ JSD เปรียบเทียบสัดส่วน class ระหว่าง reference กับ window ล่าสุด
+    raw_class_names = ref_stats["model_info"]["classes"]
+    class_names = [normalize_label(c) for c in raw_class_names]
 
-    ref_center = reference_embeddings.mean(axis=0)
-    ref_dists = np.linalg.norm(reference_embeddings - ref_center, axis=1)
-    cur_dists = np.linalg.norm(current_embeddings - ref_center, axis=1)
+    ref_dist_raw = ref_stats["class_distribution_train"]
+    ref_probs_map = {"beverage": 0.0, "snack": 0.0}
 
-    ref_dist_mean = float(ref_stats.get("embedding", {}).get("distance_mean", ref_dists.mean()))
-    ref_dist_std = float(ref_stats.get("embedding", {}).get("distance_std", ref_dists.std()))
-    ref_dist_std = max(ref_dist_std, EPS)
+    for k, v in ref_dist_raw.items():
+        if k == "total_samples":
+            continue
+        ref_probs_map[normalize_label(k)] += float(v)
 
-    score = abs(float(cur_dists.mean()) - ref_dist_mean) / ref_dist_std
-    return float(score)
+    ref_probs = np.array([ref_probs_map[c] for c in class_names], dtype=np.float32)
+    ref_probs = ref_probs / ref_probs.sum()
 
+    counter = Counter(recent_classes)
+    recent_probs = np.array([counter.get(c, 0) for c in class_names], dtype=np.float32)
+    recent_probs = recent_probs / recent_probs.sum()
 
-def build_result(
-    embedding_score: float,
-    confidence_score: float,
-    class_score: float,
-    ref_stats: Dict[str, Any],
-) -> Dict[str, Any]:
-    embedding_threshold = float(ref_stats["embedding"]["threshold"])
-    confidence_threshold = float(ref_stats["confidence"]["psi_threshold"])
-    class_threshold = float(ref_stats["class_ratio"]["jsd_threshold"])
-
-    embedding_drifted = embedding_score > embedding_threshold
-    confidence_drifted = confidence_score > confidence_threshold
-    class_drifted = class_score > class_threshold
-    is_drift = embedding_drifted or confidence_drifted or class_drifted
-
-    return {
-        "embedding_score": round(float(embedding_score), 6),
-        "confidence_score": round(float(confidence_score), 6),
-        "class_score": round(float(class_score), 6),
-        "is_drift": bool(is_drift),
-        "embedding_drifted": bool(embedding_drifted),
-        "confidence_drifted": bool(confidence_drifted),
-        "class_drifted": bool(class_drifted),
-    }
+    return float(compute_jsd(ref_probs, recent_probs))
 
 
-def calculate_drift_from_prediction_ids(
-    conn: sqlite3.Connection,
-    prediction_ids: List[int],
-    ref_stats: Dict[str, Any],
-    ref_embeddings: np.ndarray,
-) -> Dict[str, Any]:
-    rows = fetch_prediction_rows_by_ids(conn, prediction_ids)
-    if not rows:
-        raise ValueError("no prediction rows found")
-
-    confidences = [float(row["confidence"]) for row in rows]
-    classes = [str(row["predicted_class"]) for row in rows]
-    current_embeddings = fetch_embeddings_for_prediction_ids(conn, prediction_ids)
-
-    confidence_score = compute_psi(
-        current_values=confidences,
-        ref_bin_edges=ref_stats["confidence"]["bin_edges"],
-        ref_bin_probs=ref_stats["confidence"]["bin_probs"],
-    )
-
-    class_score = compute_jsd(
-        current_classes=classes,
-        labels=ref_stats["labels"],
-        ref_probs_dict=ref_stats["class_ratio"]["reference_probs"],
-    )
-
-    embedding_score = compute_embedding_score(
-        current_embeddings=current_embeddings,
-        reference_embeddings=ref_embeddings,
-        ref_stats=ref_stats,
-    )
-
-    return build_result(
-        embedding_score=embedding_score,
-        confidence_score=confidence_score,
-        class_score=class_score,
-        ref_stats=ref_stats,
-    )
-
-
-def insert_drift_event(conn: sqlite3.Connection, result: Dict[str, Any]) -> int:
-    cur = conn.execute(
+def save_drift_event(result: dict):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
         """
         INSERT INTO drift_events (
             embedding_score,
             confidence_score,
             class_score,
-            is_drift,
             embedding_drifted,
             confidence_drifted,
-            class_drifted
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            class_drifted,
+            is_drift
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            result["embedding_score"],
-            result["confidence_score"],
-            result["class_score"],
-            int(result["is_drift"]),
+            float(result["embedding_score"]),
+            float(result["confidence_score"]),
+            float(result["class_score"]),
             int(result["embedding_drifted"]),
             int(result["confidence_drifted"]),
             int(result["class_drifted"]),
+            int(result["is_drift"]),
         ),
     )
-    return int(cur.lastrowid)
+    conn.commit()
+    conn.close()
 
 
-def compute_and_store_latest_window(
-    db_path: str = DB_PATH,
-    reference_stats_path: str = REFERENCE_STATS_PATH,
-    reference_embeddings_path: str = REFERENCE_EMBEDDINGS_PATH,
-    latest_n: int = LATEST_N,
-) -> Dict[str, Any]:
-    ref_stats = load_reference_stats(reference_stats_path)
-    ref_embeddings = load_reference_embeddings(reference_embeddings_path)
+def main():
+    ref_stats = load_reference_stats()
+    ref_mean = load_reference_embedding_mean(ref_stats)
 
-    with get_conn(db_path) as conn:
-        prediction_ids = fetch_latest_prediction_ids(conn, latest_n)
-        if len(prediction_ids) < latest_n:
-            raise ValueError(f"not enough prediction rows: need {latest_n}, got {len(prediction_ids)}")
+    input_size = int(ref_stats["model_info"]["input_size"])
+    mean = ref_stats["model_info"]["norm_mean"]
+    std = ref_stats["model_info"]["norm_std"]
+    class_names = ref_stats["model_info"]["classes"]
+    num_classes = len(class_names)
 
-        result = calculate_drift_from_prediction_ids(conn, prediction_ids, ref_stats, ref_embeddings)
-        drift_event_id = insert_drift_event(conn, result)
-        conn.commit()
+    ids, recent_classes, recent_confidences, image_data_urls = load_n_latest_predictions(WINDOW_SIZE)
 
-    return {
-        "prediction_ids": prediction_ids,
-        "drift_event_id": drift_event_id,
-        **result,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = build_model(num_classes=num_classes).to(device)
+    transform = build_transform(input_size=input_size, mean=mean, std=std)
+
+    recent_embeddings = infer_recent_embeddings(
+        model=model,
+        image_data_urls=image_data_urls,
+        transform=transform,
+        device=device,
+        batch_size=BATCH_SIZE,
+    )
+
+    embedding_score = compute_embedding_drift(ref_mean, recent_embeddings)
+    confidence_score = compute_confidence_drift(ref_stats, recent_confidences)
+    class_score = compute_class_ratio_drift(ref_stats, recent_classes)
+
+    embedding_drifted = embedding_score > EMBEDDING_THRESHOLD
+    confidence_drifted = confidence_score > CONFIDENCE_THRESHOLD
+    class_drifted = class_score > CLASS_THRESHOLD
+
+    result = {
+        "prediction_ids": ids,
+        "window_size": WINDOW_SIZE,
+        "embedding_score": embedding_score,
+        "confidence_score": confidence_score,
+        "class_score": class_score,
+        "embedding_drifted": embedding_drifted,
+        "confidence_drifted": confidence_drifted,
+        "class_drifted": class_drifted,
+        "is_drift": embedding_drifted or confidence_drifted or class_drifted,
     }
 
-
-def main() -> None:
-    result = compute_and_store_latest_window()
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    save_drift_event(result)
 
 
 if __name__ == "__main__":
