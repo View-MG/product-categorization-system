@@ -1,371 +1,351 @@
-from __future__ import annotations
-
-import json
+import sys
 import sqlite3
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 import numpy as np
+import torch
 
-try:
-    from compute_drift import (
-        calculate_drift_from_prediction_ids,
-        get_conn,
-        insert_drift_event,
-        load_reference_embeddings,
-        load_reference_stats,
-    )
-except ImportError:
-    from scripts.compute_drift import (
-        calculate_drift_from_prediction_ids,
-        get_conn,
-        insert_drift_event,
-        load_reference_embeddings,
-        load_reference_stats,
-    )
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
+from src.monitoring.store import (
+    DB_PATH,
+    init_db,
+    insert_alert,
+    insert_drift_event,
+)
+from scripts.compute_drift import (
+    WINDOW_SIZE,
+    BATCH_SIZE,
+    EMBEDDING_THRESHOLD,
+    CONFIDENCE_THRESHOLD,
+    CLASS_THRESHOLD,
+    build_model,
+    build_transform,
+    compute_class_ratio_drift,
+    compute_confidence_drift,
+    compute_embedding_drift,
+    infer_recent_embeddings,
+    load_reference_embedding_mean,
+    load_reference_stats,
+)
 
-DB_PATH = "monitoring.db"
-REFERENCE_STATS_PATH = "reference_stats.json"
-REFERENCE_EMBEDDINGS_PATH = "reference_embeddings.npz"
+COOLDOWN_MINUTES = 60
 
-WINDOW_SIZE = 50
-COOLDOWN_MINUTES = 30
-
-STATE_KEY_LAST_PROCESSED_ID = "last_processed_prediction_id"
-
-
-def now_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def parse_dt(value: str) -> datetime:
-    value = value.strip()
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
-    except Exception:
-        pass
-
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(value, fmt)
-        except Exception:
-            pass
-
-    return datetime.utcnow()
+_RUNTIME_CACHE = {
+    "loaded": False,
+    "ref_stats": None,
+    "ref_mean": None,
+    "class_names": None,
+    "input_size": None,
+    "mean": None,
+    "std": None,
+    "num_classes": None,
+    "device": None,
+    "model": None,
+    "transform": None,
+}
 
 
-def init_db(db_path: str = DB_PATH) -> None:
-    with get_conn(db_path) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS prediction_events (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp        DATETIME DEFAULT CURRENT_TIMESTAMP,
-                predicted_class  TEXT NOT NULL,
-                confidence       FLOAT NOT NULL,
-                latency_ms       FLOAT,
-                brightness       FLOAT,
-                blur_var         FLOAT,
-                width            INTEGER,
-                height           INTEGER,
-                quality_warnings TEXT DEFAULT '[]'
-            );
-
-            CREATE TABLE IF NOT EXISTS human_feedback (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                prediction_id  INTEGER NOT NULL REFERENCES prediction_events(id),
-                true_label     TEXT NOT NULL,
-                labeled_at     DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS drift_events (
-                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp          DATETIME DEFAULT CURRENT_TIMESTAMP,
-                embedding_score    FLOAT,
-                confidence_score   FLOAT,
-                class_score        FLOAT,
-                is_drift           BOOLEAN DEFAULT 0,
-                embedding_drifted  BOOLEAN DEFAULT 0,
-                confidence_drifted BOOLEAN DEFAULT 0,
-                class_drifted      BOOLEAN DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS alerts (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
-                alert_type  TEXT NOT NULL,
-                message     TEXT,
-                resolved    BOOLEAN DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS prediction_embeddings (
-                prediction_id INTEGER PRIMARY KEY REFERENCES prediction_events(id) ON DELETE CASCADE,
-                embedding_json TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS orchestrator_state (
-                state_key   TEXT PRIMARY KEY,
-                state_value TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_prediction_events_id
-            ON prediction_events(id);
-
-            CREATE INDEX IF NOT EXISTS idx_alerts_type_timestamp
-            ON alerts(alert_type, timestamp);
-            """
+def ensure_system_state_table() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         )
-        conn.commit()
+        """
+    )
+    conn.commit()
+    conn.close()
 
 
-def get_state_int(conn: sqlite3.Connection, state_key: str, default: int = 0) -> int:
+def get_last_drift_prediction_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT value FROM system_state WHERE key = 'last_drift_prediction_id'"
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def set_last_drift_prediction_id(conn: sqlite3.Connection, prediction_id: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO system_state (key, value)
+        VALUES ('last_drift_prediction_id', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (str(prediction_id),),
+    )
+
+
+def get_latest_ready_prediction_id(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         """
-        SELECT state_value
-        FROM orchestrator_state
-        WHERE state_key = ?
-        """,
-        (state_key,),
+        SELECT MAX(id)
+        FROM prediction_events
+        WHERE image_data_url IS NOT NULL
+          AND TRIM(image_data_url) != ''
+        """
     ).fetchone()
 
-    if row is None:
-        return default
+    if row is None or row[0] is None:
+        return 0
 
-    try:
-        return int(row["state_value"])
-    except Exception:
-        return default
+    return int(row[0])
 
 
-def set_state_int(conn: sqlite3.Connection, state_key: str, value: int) -> None:
-    conn.execute(
-        """
-        INSERT INTO orchestrator_state (state_key, state_value)
-        VALUES (?, ?)
-        ON CONFLICT(state_key) DO UPDATE SET state_value = excluded.state_value
-        """,
-        (state_key, str(int(value))),
-    )
+def get_runtime_components():
+    if _RUNTIME_CACHE["loaded"]:
+        return _RUNTIME_CACHE
+
+    ref_stats = load_reference_stats()
+    ref_mean = load_reference_embedding_mean(ref_stats)
+
+    class_names = ref_stats["model_info"]["classes"]
+    input_size = int(ref_stats["model_info"]["input_size"])
+    mean = ref_stats["model_info"]["norm_mean"]
+    std = ref_stats["model_info"]["norm_std"]
+    num_classes = len(class_names)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(num_classes=num_classes).to(device)
+    transform = build_transform(input_size=input_size, mean=mean, std=std)
+
+    _RUNTIME_CACHE.update({
+        "loaded": True,
+        "ref_stats": ref_stats,
+        "ref_mean": ref_mean,
+        "class_names": class_names,
+        "input_size": input_size,
+        "mean": mean,
+        "std": std,
+        "num_classes": num_classes,
+        "device": device,
+        "model": model,
+        "transform": transform,
+    })
+    return _RUNTIME_CACHE
 
 
-def insert_prediction_event(conn: sqlite3.Connection, result: Dict[str, Any]) -> int:
-    timestamp = result.get("timestamp", now_str())
-    predicted_class = str(result["predicted_class"])
-    confidence = float(result["confidence"])
-    latency_ms = None if result.get("latency_ms") is None else float(result["latency_ms"])
-    brightness = None if result.get("brightness") is None else float(result["brightness"])
-    blur_var = None if result.get("blur_var") is None else float(result["blur_var"])
-    width = None if result.get("width") is None else int(result["width"])
-    height = None if result.get("height") is None else int(result["height"])
-    quality_warnings = json.dumps(result.get("quality_warnings", []), ensure_ascii=False)
+def normalize_class_name(name: str, allowed_classes: list[str]) -> str:
+    raw = str(name).strip()
+    raw_lower = raw.lower()
 
-    cur = conn.execute(
-        """
-        INSERT INTO prediction_events (
-            timestamp,
-            predicted_class,
-            confidence,
-            latency_ms,
-            brightness,
-            blur_var,
-            width,
-            height,
-            quality_warnings
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            timestamp,
-            predicted_class,
-            confidence,
-            latency_ms,
-            brightness,
-            blur_var,
-            width,
-            height,
-            quality_warnings,
-        ),
-    )
-    return int(cur.lastrowid)
+    alias_map = {
+        "beverage": "beverage",
+        "beverages": "beverage",
+        "snack": "snack",
+        "snacks": "snack",
+    }
+
+    if raw in allowed_classes:
+        return raw
+
+    if raw_lower in alias_map:
+        normalized = alias_map[raw_lower]
+        for allowed in allowed_classes:
+            if allowed.lower() == normalized:
+                return allowed
+
+    for allowed in allowed_classes:
+        if raw_lower == allowed.lower():
+            return allowed
+
+    raise ValueError(f"invalid predicted_class={name!r}, allowed={allowed_classes}")
 
 
-def insert_prediction_embedding(conn: sqlite3.Connection, prediction_id: int, embedding: Any) -> None:
-    embedding_arr = np.asarray(embedding, dtype=np.float32).reshape(-1)
-    embedding_json = json.dumps(embedding_arr.tolist(), ensure_ascii=False)
-
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO prediction_embeddings (prediction_id, embedding_json)
-        VALUES (?, ?)
-        """,
-        (prediction_id, embedding_json),
-    )
-
-
-def fetch_next_window_prediction_ids(
-    conn: sqlite3.Connection,
-    start_after_id: int,
-    window_size: int,
-) -> List[int]:
-    rows = conn.execute(
-        """
-        SELECT id
-        FROM prediction_events
-        WHERE id > ?
-        ORDER BY id ASC
-        LIMIT ?
-        """,
-        (start_after_id, window_size),
-    ).fetchall()
-    return [int(row["id"]) for row in rows]
-
-
-def get_last_alert_time(conn: sqlite3.Connection, alert_type: str) -> Optional[datetime]:
+def count_new_ready_predictions(conn: sqlite3.Connection, last_drift_prediction_id: int) -> int:
     row = conn.execute(
         """
-        SELECT timestamp
+        SELECT COUNT(*)
+        FROM prediction_events
+        WHERE id > ?
+          AND image_data_url IS NOT NULL
+          AND TRIM(image_data_url) != ''
+        """,
+        (last_drift_prediction_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def load_latest_window_from_db(
+    conn: sqlite3.Connection,
+    window_size: int,
+    allowed_classes: list[str],
+):
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute(
+        """
+        SELECT id, predicted_class, confidence, image_data_url
+        FROM prediction_events
+        WHERE image_data_url IS NOT NULL
+          AND TRIM(image_data_url) != ''
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (window_size,),
+    ).fetchall()
+
+    if len(rows) < window_size:
+        raise ValueError(
+            f"not enough ready prediction rows: need {window_size}, got {len(rows)}"
+        )
+
+    rows = rows[::-1]
+
+    ids = [int(r["id"]) for r in rows]
+    classes = [normalize_class_name(r["predicted_class"], allowed_classes) for r in rows]
+    confidences = np.array([float(r["confidence"]) for r in rows], dtype=np.float32)
+    image_data_urls = [str(r["image_data_url"]) for r in rows]
+
+    if np.any(confidences < 0.0) or np.any(confidences > 1.0):
+        raise ValueError("confidence must be between 0 and 1")
+
+    return ids, classes, confidences, image_data_urls
+
+
+def compute_drift_for_latest_window() -> dict:
+    runtime = get_runtime_components()
+
+    conn = sqlite3.connect(DB_PATH)
+    ids, recent_classes, recent_confidences, image_data_urls = load_latest_window_from_db(
+        conn=conn,
+        window_size=WINDOW_SIZE,
+        allowed_classes=runtime["class_names"],
+    )
+    conn.close()
+
+    recent_embeddings = infer_recent_embeddings(
+        model=runtime["model"],
+        image_data_urls=image_data_urls,
+        transform=runtime["transform"],
+        device=runtime["device"],
+        batch_size=BATCH_SIZE,
+    )
+
+    embedding_score = compute_embedding_drift(runtime["ref_mean"], recent_embeddings)
+    confidence_score = compute_confidence_drift(runtime["ref_stats"], recent_confidences)
+    class_score = compute_class_ratio_drift(runtime["ref_stats"], recent_classes)
+
+    embedding_drifted = embedding_score > EMBEDDING_THRESHOLD
+    confidence_drifted = confidence_score > CONFIDENCE_THRESHOLD
+    class_drifted = class_score > CLASS_THRESHOLD
+    is_drift = embedding_drifted or confidence_drifted or class_drifted
+
+    return {
+        "prediction_ids": ids,
+        "window_size": WINDOW_SIZE,
+        "embedding_score": float(embedding_score),
+        "confidence_score": float(confidence_score),
+        "class_score": float(class_score),
+        "embedding_drifted": bool(embedding_drifted),
+        "confidence_drifted": bool(confidence_drifted),
+        "class_drifted": bool(class_drifted),
+        "is_drift": bool(is_drift),
+    }
+
+
+def in_alert_cooldown(conn: sqlite3.Connection, cooldown_minutes: int) -> bool:
+    row = conn.execute(
+        """
+        SELECT id
         FROM alerts
-        WHERE alert_type = ?
+        WHERE timestamp >= datetime('now', ?)
         ORDER BY id DESC
         LIMIT 1
         """,
-        (alert_type,),
+        (f"-{cooldown_minutes} minutes",),
     ).fetchone()
-
-    if row is None or row["timestamp"] is None:
-        return None
-
-    return parse_dt(str(row["timestamp"]))
+    return row is not None
 
 
-def is_in_cooldown(conn: sqlite3.Connection, alert_type: str, cooldown_minutes: int) -> bool:
-    last_alert_time = get_last_alert_time(conn, alert_type)
-    if last_alert_time is None:
-        return False
-    return datetime.utcnow() - last_alert_time < timedelta(minutes=cooldown_minutes)
-
-
-def insert_alert(conn: sqlite3.Connection, alert_type: str, message: str) -> int:
-    cur = conn.execute(
-        """
-        INSERT INTO alerts (timestamp, alert_type, message, resolved)
-        VALUES (?, ?, ?, 0)
-        """,
-        (now_str(), alert_type, message),
-    )
-    return int(cur.lastrowid)
-
-
-def build_alert_message(
-    drift_result: Dict[str, Any],
-    window_prediction_ids: List[int],
-) -> str:
+def build_alert_message(result: dict) -> str:
     parts = []
 
-    if drift_result["embedding_drifted"]:
-        parts.append(f"embedding={drift_result['embedding_score']:.4f}")
-    if drift_result["confidence_drifted"]:
-        parts.append(f"confidence={drift_result['confidence_score']:.4f}")
-    if drift_result["class_drifted"]:
-        parts.append(f"class={drift_result['class_score']:.4f}")
+    if result["embedding_drifted"]:
+        parts.append(f"embedding={result['embedding_score']:.4f}")
+    if result["confidence_drifted"]:
+        parts.append(f"confidence={result['confidence_score']:.4f}")
+    if result["class_drifted"]:
+        parts.append(f"class={result['class_score']:.4f}")
 
-    detail = ", ".join(parts) if parts else "unknown"
-    return (
-        f"Drift detected for prediction window "
-        f"{window_prediction_ids[0]}-{window_prediction_ids[-1]}: {detail}"
+    if not parts:
+        parts.append("threshold exceeded")
+
+    return "Drift detected: " + ", ".join(parts)
+
+
+def run_orchestrator_from_db(cooldown_minutes: int = COOLDOWN_MINUTES) -> dict:
+    init_db()
+    ensure_system_state_table()
+    get_runtime_components()
+
+    conn = sqlite3.connect(DB_PATH)
+    last_drift_prediction_id = get_last_drift_prediction_id(conn)
+    latest_prediction_id = get_latest_ready_prediction_id(conn)
+    new_count = count_new_ready_predictions(conn, last_drift_prediction_id)
+    conn.close()
+
+    if latest_prediction_id == 0:
+        return {
+            "drift_checked": False,
+            "reason": "no ready predictions in prediction_events",
+            "alert_created": False,
+        }
+
+    if new_count < WINDOW_SIZE:
+        return {
+            "drift_checked": False,
+            "latest_prediction_id": latest_prediction_id,
+            "reason": f"waiting for more data ({new_count}/{WINDOW_SIZE})",
+            "alert_created": False,
+        }
+
+    drift_result = compute_drift_for_latest_window()
+
+    insert_drift_event(
+        embedding_score=drift_result["embedding_score"],
+        confidence_score=drift_result["confidence_score"],
+        class_score=drift_result["class_score"],
+        is_drift=drift_result["is_drift"],
+        embedding_drifted=drift_result["embedding_drifted"],
+        confidence_drifted=drift_result["confidence_drifted"],
+        class_drifted=drift_result["class_drifted"],
     )
 
+    conn = sqlite3.connect(DB_PATH)
+    should_create_alert = drift_result["is_drift"] and not in_alert_cooldown(conn, cooldown_minutes)
 
-class DriftOrchestrator:
-    def __init__(
-        self,
-        db_path: str = DB_PATH,
-        reference_stats_path: str = REFERENCE_STATS_PATH,
-        reference_embeddings_path: str = REFERENCE_EMBEDDINGS_PATH,
-        window_size: int = WINDOW_SIZE,
-        cooldown_minutes: int = COOLDOWN_MINUTES,
-    ) -> None:
-        init_db(db_path)
-        self.db_path = db_path
-        self.reference_stats = load_reference_stats(reference_stats_path)
-        self.reference_embeddings = load_reference_embeddings(reference_embeddings_path)
-        self.window_size = int(window_size)
-        self.cooldown_minutes = int(cooldown_minutes)
-        self.alert_type = "drift"
+    set_last_drift_prediction_id(conn, drift_result["prediction_ids"][-1])
+    conn.commit()
+    conn.close()
 
-    def process_pending_windows(self, conn: sqlite3.Connection) -> Dict[str, List[int]]:
-        drift_event_ids: List[int] = []
-        alert_ids: List[int] = []
+    alert_created = False
+    if should_create_alert:
+        insert_alert(
+            alert_type="drift",
+            message=build_alert_message(drift_result),
+        )
+        alert_created = True
 
-        while True:
-            last_processed_id = get_state_int(conn, STATE_KEY_LAST_PROCESSED_ID, 0)
-            prediction_ids = fetch_next_window_prediction_ids(conn, last_processed_id, self.window_size)
-
-            if len(prediction_ids) < self.window_size:
-                break
-
-            drift_result = calculate_drift_from_prediction_ids(
-                conn=conn,
-                prediction_ids=prediction_ids,
-                ref_stats=self.reference_stats,
-                ref_embeddings=self.reference_embeddings,
-            )
-
-            drift_event_id = insert_drift_event(conn, drift_result)
-            drift_event_ids.append(drift_event_id)
-
-            set_state_int(conn, STATE_KEY_LAST_PROCESSED_ID, prediction_ids[-1])
-
-            if drift_result["is_drift"] and not is_in_cooldown(conn, self.alert_type, self.cooldown_minutes):
-                message = build_alert_message(drift_result, prediction_ids)
-                alert_id = insert_alert(conn, self.alert_type, message)
-                alert_ids.append(alert_id)
-
-        return {
-            "drift_event_ids": drift_event_ids,
-            "alert_ids": alert_ids,
-        }
-
-    def handle_inference(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        with get_conn(self.db_path) as conn:
-            prediction_id = insert_prediction_event(conn, result)
-
-            if result.get("embedding") is not None:
-                insert_prediction_embedding(conn, prediction_id, result["embedding"])
-
-            processed = self.process_pending_windows(conn)
-            conn.commit()
-
-        return {
-            "prediction_id": prediction_id,
-            "drift_event_ids": processed["drift_event_ids"],
-            "alert_ids": processed["alert_ids"],
-        }
+    return {
+        "drift_checked": True,
+        "window_start_id": drift_result["prediction_ids"][0],
+        "window_end_id": drift_result["prediction_ids"][-1],
+        "embedding_score": drift_result["embedding_score"],
+        "confidence_score": drift_result["confidence_score"],
+        "class_score": drift_result["class_score"],
+        "embedding_drifted": drift_result["embedding_drifted"],
+        "confidence_drifted": drift_result["confidence_drifted"],
+        "class_drifted": drift_result["class_drifted"],
+        "is_drift": drift_result["is_drift"],
+        "alert_created": alert_created,
+    }
 
 
 if __name__ == "__main__":
-    orchestrator = DriftOrchestrator(
-        db_path=DB_PATH,
-        reference_stats_path=REFERENCE_STATS_PATH,
-        reference_embeddings_path=REFERENCE_EMBEDDINGS_PATH,
-        window_size=50,
-        cooldown_minutes=30,
-    )
-
-    embedding_dim = int(orchestrator.reference_embeddings.shape[1])
-
-    sample_result = {
-        "predicted_class": "beverages",
-        "confidence": 0.91,
-        "latency_ms": 38.4,
-        "brightness": 126.7,
-        "blur_var": 215.2,
-        "width": 224,
-        "height": 224,
-        "quality_warnings": [],
-        "embedding": np.random.rand(embedding_dim).astype(np.float32).tolist(),
-    }
-
-    out = orchestrator.handle_inference(sample_result)
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    result = run_orchestrator_from_db()
+    print(result)
