@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -10,18 +11,31 @@ from safetensors.torch import load_file
 from torchvision import transforms
 from torchvision.models import convnext_tiny
 from tqdm.auto import tqdm
-from datetime import datetime
 
 import cv2
 
+
 MANIFEST_PATH = Path("data_local/processed/data_v2")
 MODEL_PATH = Path("model.safetensors")
+
+OUTPUT_DIR = Path("reference")
+REFERENCE_STATS_PATH = OUTPUT_DIR / "reference_stats.json"
+REFERENCE_EMBEDDINGS_PATH = OUTPUT_DIR / "reference_embeddings.npz"
+
 IMAGE_COL = "abs_path"
 LABEL_COL = "label_coarse"
+
 NUM_CLASSES = 2
+CLASS_NAMES = ["beverage", "snack"]
+ARCHITECTURE = "convnext_tiny"
+
 INPUT_SIZE = 224
-SAMPLE_EMBEDDINGS = 1000
+NORM_MEAN = [0.485, 0.456, 0.406]
+NORM_STD = [0.229, 0.224, 0.225]
+
+SAMPLE_EMBEDDINGS = 500
 RANDOM_STATE = 42
+
 
 def build_model():
     model = convnext_tiny(weights=None)
@@ -54,14 +68,12 @@ def load_model(model_path: Path):
     model.eval()
     return model
 
+
 def build_transform():
     return transforms.Compose([
         transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
+        transforms.Normalize(mean=NORM_MEAN, std=NORM_STD)
     ])
 
 def compute_brightness(image: Image.Image) -> float:
@@ -114,6 +126,7 @@ def extract_embedding_and_confidence(model, image_path: str, transform):
         "height": int(height),
     }
 
+
 def compute_confidence_stats(confidences):
     confidences = np.asarray(confidences, dtype=np.float32)
     bin_edges = np.array([0.5, 0.6, 0.7, 0.8, 0.9, 1.0], dtype=np.float32)
@@ -123,25 +136,32 @@ def compute_confidence_stats(confidences):
         "bin_edges": edges.tolist(),
         "counts": counts.tolist(),
         "mean": float(confidences.mean()),
-        "std": float(confidences.std())
+        "std": float(confidences.std()),
+        "percentile_10": float(np.percentile(confidences, 10)),
+        "percentile_25": float(np.percentile(confidences, 25)),
+        "percentile_75": float(np.percentile(confidences, 75)),
+        "percentile_90": float(np.percentile(confidences, 90)),
     }
+
 
 def compute_class_ratio(labels):
     series = pd.Series(labels)
-    ratio = series.value_counts(normalize=True).sort_index().to_dict()
+    counts = series.value_counts(normalize=True)
+
+    ratio = {}
+    for class_name in CLASS_NAMES:
+        ratio[class_name] = float(counts.get(class_name, 0.0))
+
     ratio["total_samples"] = int(len(labels))
     return ratio
 
-def compute_basic_stats(values):
-    arr = np.asarray(values, dtype=np.float32)
-    return {
-        "mean": float(arr.mean()),
-        "std": float(arr.std()),
-        "min": float(arr.min()),
-        "max": float(arr.max())
-    }
 
-def build_reference_stats(records):
+def compute_percentiles(values, keys):
+    arr = np.asarray(values, dtype=np.float32)
+    return {key: float(np.percentile(arr, p)) for key, p in keys.items()}
+
+
+def build_reference_stats(records, checkpoint_path: Path):
     embeddings = np.stack([r["embedding"] for r in records], axis=0)
     confidences = [r["confidence"] for r in records]
     labels = [r["label"] for r in records]
@@ -151,27 +171,53 @@ def build_reference_stats(records):
     heights = [r["height"] for r in records]
 
     reference_stats = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+
+        "model_info": {
+            "checkpoint_path": str(checkpoint_path).replace("\\", "/"),
+            "architecture": ARCHITECTURE,
+            "classes": CLASS_NAMES,
+            "input_size": INPUT_SIZE,
+            "norm_mean": NORM_MEAN,
+            "norm_std": NORM_STD,
+            "embedding_dim": int(embeddings.shape[1]),
+        },
+
+        "class_distribution_train": compute_class_ratio(labels),
+
+        "confidence_histogram": compute_confidence_stats(confidences),
+
         "embedding_stats": {
             "mean": embeddings.mean(axis=0).tolist(),
             "std": embeddings.std(axis=0).tolist(),
-            "embedding_dim": int(embeddings.shape[1]),
-            "num_samples": int(embeddings.shape[0])
+            "sample_path": str(REFERENCE_EMBEDDINGS_PATH).replace("\\", "/"),
+            "n_samples": int(min(SAMPLE_EMBEDDINGS, len(records))),
         },
-        "confidence_histogram": compute_confidence_stats(confidences),
-        "class_distribution_train": compute_class_ratio(labels),
-        "quality_stats": {
-            "brightness": compute_basic_stats(brightnesses),
-            "blur_var": compute_basic_stats(blur_vars)
+
+        "quality_percentiles": {
+            "brightness": compute_percentiles(
+                brightnesses,
+                {"p10": 10, "p25": 25, "p50": 50, "p75": 75, "p90": 90},
+            ),
+            "blur_var": compute_percentiles(
+                blur_vars,
+                {"p10": 10, "p25": 25, "p50": 50, "p75": 75, "p90": 90},
+            ),
+            "width": compute_percentiles(
+                widths,
+                {"p10": 10, "p50": 50},
+            ),
+            "height": compute_percentiles(
+                heights,
+                {"p10": 10, "p50": 50},
+            ),
         },
-        "image_size_stats": {
-            "width": compute_basic_stats(widths),
-            "height": compute_basic_stats(heights)
-        }
     }
 
     return reference_stats
 
-def stratified_sample_embeddings(records, sample_size=1000, random_state=42):
+
+def stratified_sample_embeddings(records, sample_size=500, random_state=42):
     total = len(records)
     if total == 0:
         raise ValueError("records is empty")
@@ -229,13 +275,18 @@ def stratified_sample_embeddings(records, sample_size=1000, random_state=42):
         "image_paths": image_paths
     }
 
-def save_reference_embeddings_npz(sampled_data, output_path="reference_embeddings.npz"):
+
+def save_reference_embeddings_npz(sampled_data, output_path=REFERENCE_EMBEDDINGS_PATH):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     np.savez_compressed(
         output_path,
         embeddings=sampled_data["embeddings"].astype(np.float32),
         labels=sampled_data["labels"],
         image_paths=sampled_data["image_paths"]
     )
+
 
 def main():
     csv_path = MANIFEST_PATH / "manifest_clean.csv"
@@ -244,6 +295,8 @@ def main():
 
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(csv_path)
 
@@ -280,11 +333,6 @@ def main():
             "height": result["height"]
         })
 
-    reference_stats = build_reference_stats(records)
-
-    with open("reference_stats.json", "w", encoding="utf-8") as f:
-        json.dump(reference_stats, f, indent=2, ensure_ascii=False)
-
     sampled_data = stratified_sample_embeddings(
         records,
         sample_size=SAMPLE_EMBEDDINGS,
@@ -293,12 +341,21 @@ def main():
 
     save_reference_embeddings_npz(
         sampled_data,
-        output_path="reference_embeddings.npz"
+        output_path=REFERENCE_EMBEDDINGS_PATH
     )
 
-    print("saved: reference_stats.json")
-    print("saved: reference_embeddings.npz")
-    print(pd.Series(sampled_data["labels"]).value_counts().sort_index())
+    reference_stats = build_reference_stats(
+        records=records,
+        checkpoint_path=MODEL_PATH
+    )
+
+    with open(REFERENCE_STATS_PATH, "w", encoding="utf-8") as f:
+        json.dump(reference_stats, f, indent=2, ensure_ascii=False)
+
+    print(f"saved: {REFERENCE_STATS_PATH}")
+    print(f"saved: {REFERENCE_EMBEDDINGS_PATH}")
+    print(pd.Series(sampled_data['labels']).value_counts().sort_index())
+
 
 if __name__ == "__main__":
     main()
