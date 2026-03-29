@@ -3,7 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+test/
 data_local/
+*.safttensors
+
 # C extensions
 *.so
 
