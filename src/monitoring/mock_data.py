@@ -31,7 +31,7 @@ PER_CLASS_COUNT = 50
 SEED = 42
 CLEAR_FIRST = True
 WRITE_FEEDBACK = True
-RUN_MODE = "drift"  # "no_drift", "drift", "both"
+RUN_MODE = "no_drift"  # "no_drift", "drift", "both"
 
 
 def normalize_label(name: str) -> str:
